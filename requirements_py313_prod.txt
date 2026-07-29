@@ -1,0 +1,9 @@
+anyio==4.13.0
+fastmcp==3.2.4
+motor==3.7.1
+pydantic==2.13.3
+pydantic-settings==2.14.1
+pymongo==4.17.0
+PyYAML==6.0.3
+typing_extensions==4.15.0
+uvicorn==0.46.0

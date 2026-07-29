@@ -1,0 +1,4 @@
+server_port: 8446
+mongodb_host: gtrai.sec.samsung.net
+mongodb_port: 27017
+mongodb_db_name: cosmoData

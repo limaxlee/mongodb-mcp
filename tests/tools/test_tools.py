@@ -1,0 +1,324 @@
+import pytest
+import pytest_asyncio
+from fastmcp.exceptions import ToolError
+
+from mongodb_mcp.tools import tools_mcp
+
+
+@pytest_asyncio.fixture
+async def tools_by_name():
+    tools = await tools_mcp.list_tools()
+    return {tool.name: tool.fn for tool in tools}
+
+
+class TestMongoDBMCPTools:
+    @pytest.mark.asyncio
+    async def test_mongodb_list_databases(self, mocker, tools_by_name, mock_context):
+        tool = tools_by_name["mongodb_list_databases"]
+        result = await tool(mock_context)
+
+        assert "default" in result
+        assert "test_db" in result
+
+        mock_context.request_context.lifespan_context.connector.list_databases = \
+            mocker.AsyncMock(side_effect=RuntimeError())
+        with pytest.raises(ToolError):
+            await tool(mock_context)
+
+    @pytest.mark.asyncio
+    async def test_mongodb_list_collections(self, mocker, tools_by_name, mock_context):
+        tool = tools_by_name["mongodb_list_collections"]
+        result = await tool(mock_context)
+
+        assert "collection_a" in result
+        assert "collection_b" in result
+
+        mock_context.request_context.lifespan_context.connector.list_collections = \
+            mocker.AsyncMock(side_effect=RuntimeError())
+        with pytest.raises(ToolError):
+            await tool(mock_context)
+
+    @pytest.mark.asyncio
+    async def test_mongodb_create_collection(self, mocker, tools_by_name, mock_context):
+        tool = tools_by_name["mongodb_create_collection"]
+        result = await tool(mock_context, "collection_c")
+
+        assert "collection_c" in result
+        assert "created successfully" in result
+
+        result = await tool(mock_context, "collection_d", {"capped": True, "size": 1024})
+        assert "collection_d" in result
+
+        mock_context.request_context.lifespan_context.connector.create_collection = \
+            mocker.AsyncMock(side_effect=RuntimeError())
+        with pytest.raises(ToolError):
+            await tool(mock_context, "collection_c")
+
+    @pytest.mark.asyncio
+    async def test_mongodb_drop_collection(self, mocker, tools_by_name, mock_context):
+        tool = tools_by_name["mongodb_drop_collection"]
+        result = await tool(mock_context, "collection_a")
+
+        assert "collection_a" in result
+        assert "dropped successfully" in result
+
+        mock_context.request_context.lifespan_context.connector.drop_collection = \
+            mocker.AsyncMock(side_effect=RuntimeError())
+        with pytest.raises(ToolError):
+            await tool(mock_context, "collection_a")
+
+    @pytest.mark.asyncio
+    async def test_mongodb_rename_collection(self, mocker, tools_by_name, mock_context):
+        tool = tools_by_name["mongodb_rename_collection"]
+        result = await tool(mock_context, "collection_a", "collection_renamed")
+
+        assert "collection_a" in result
+        assert "Successfully renamed" in result
+
+        mock_context.request_context.lifespan_context.connector.rename_collection = \
+            mocker.AsyncMock(side_effect=RuntimeError())
+        with pytest.raises(ToolError):
+            await tool(mock_context, "collection_a", "collection_renamed")
+
+    @pytest.mark.asyncio
+    async def test_mongodb_get_collection_stats(self, mocker, tools_by_name, mock_context):
+        tool = tools_by_name["mongodb_get_collection_stats"]
+        result = await tool(mock_context, "collection_a")
+
+        assert result["db"] == "testDb"
+        assert result["collections"] == 10
+
+        mock_context.request_context.lifespan_context.connector.get_collection_stats = \
+            mocker.AsyncMock(side_effect=RuntimeError())
+        with pytest.raises(ToolError):
+            await tool(mock_context, "collection_a")
+
+    @pytest.mark.asyncio
+    async def test_mongodb_get_database_stats(self, mocker, tools_by_name, mock_context):
+        tool = tools_by_name["mongodb_get_database_stats"]
+        result = await tool(mock_context)
+
+        assert result["db"] == "testDb"
+        assert result["collections"] == 10
+
+        mock_context.request_context.lifespan_context.connector.get_database_stats = \
+            mocker.AsyncMock(side_effect=RuntimeError())
+        with pytest.raises(ToolError):
+            await tool(mock_context)
+
+    @pytest.mark.asyncio
+    async def test_mongodb_list_indices(self, mocker, tools_by_name, mock_context):
+        tool = tools_by_name["mongodb_list_indices"]
+        result = await tool(mock_context, "collection_a")
+        assert result["collection"] == "collection_a"
+
+        mock_context.request_context.lifespan_context.connector.list_indices = \
+            mocker.AsyncMock(return_value=[])
+        result = await tool(mock_context, "collection_a")
+        assert result["count"] == 0
+
+        mock_context.request_context.lifespan_context.connector.list_indices = \
+            mocker.AsyncMock(side_effect=RuntimeError())
+        with pytest.raises(ToolError):
+            await tool(mock_context, "collection_a")
+
+    @pytest.mark.asyncio
+    async def test_mongodb_create_index(self, mocker, tools_by_name, mock_context):
+        tool = tools_by_name["mongodb_create_index"]
+        result = await tool(mock_context, "collection_a", {"field": 1})
+
+        assert "collection_a" in result
+        assert "Created index" in result
+
+        result = await tool(mock_context, "collection_a", {"field": 1}, {"unique": True})
+        assert "collection_a" in result
+
+        mock_context.request_context.lifespan_context.connector.create_index = \
+            mocker.AsyncMock(side_effect=RuntimeError())
+        with pytest.raises(ToolError):
+            await tool(mock_context, "collection_a", {"field": 1})
+
+    @pytest.mark.asyncio
+    async def test_mongodb_drop_index(self, mocker, tools_by_name, mock_context):
+        tool = tools_by_name["mongodb_drop_index"]
+        result = await tool(mock_context, "collection_a", "field_1")
+
+        assert "collection_a" in result
+        assert "Dropped index field_1" in result
+
+        mock_context.request_context.lifespan_context.connector.drop_index = \
+            mocker.AsyncMock(side_effect=RuntimeError())
+        with pytest.raises(ToolError):
+            await tool(mock_context, "collection_a", "field_1")
+
+    @pytest.mark.asyncio
+    async def test_mongodb_get_server_status(self, mocker, tools_by_name, mock_context):
+        tool = tools_by_name["mongodb_get_server_status"]
+        result = await tool(mock_context)
+
+        assert result.host == "localhost:27017"
+        assert result.version == "7.0.0"
+
+        mock_context.request_context.lifespan_context.connector.get_server_status = \
+            mocker.AsyncMock(side_effect=RuntimeError())
+        with pytest.raises(ToolError):
+            await tool(mock_context)
+
+    @pytest.mark.asyncio
+    async def test_mongodb_ping_database(self, mocker, tools_by_name, mock_context):
+        tool = tools_by_name["mongodb_ping_database"]
+        mock_context.request_context.lifespan_context.connector.ping_database = \
+            mocker.AsyncMock(return_value={"ok": 1})
+        result = await tool(mock_context)
+        assert result == {"ok": 1}
+
+        mock_context.request_context.lifespan_context.connector.ping_database = \
+            mocker.AsyncMock(side_effect=RuntimeError())
+        with pytest.raises(ToolError):
+            await tool(mock_context)
+
+    @pytest.mark.asyncio
+    async def test_mongodb_insert_document(self, mocker, tools_by_name, mock_context):
+        tool = tools_by_name["mongodb_insert_document"]
+        result = await tool(mock_context, "collection_a", {"name": "test"})
+
+        assert "collection_a" in result
+        assert "doc_id_1" in result
+        assert "Inserted document" in result
+
+        mock_context.request_context.lifespan_context.connector.insert_document = \
+            mocker.AsyncMock(side_effect=RuntimeError())
+        with pytest.raises(ToolError):
+            await tool(mock_context, "collection_a", {"name": "test"})
+
+    @pytest.mark.asyncio
+    async def test_mongodb_insert_many_documents(self, mocker, tools_by_name, mock_context):
+        tool = tools_by_name["mongodb_insert_many_documents"]
+        docs = [{"name": "a"}, {"name": "b"}, {"name": "c"}]
+        result = await tool(mock_context, "collection_a", docs)
+
+        assert "doc_id_1" in result
+        assert "doc_id_2" in result
+        assert "doc_id_3" in result
+
+        mock_context.request_context.lifespan_context.connector.insert_many_documents = \
+            mocker.AsyncMock(side_effect=RuntimeError())
+        with pytest.raises(ToolError):
+            await tool(mock_context, "collection_a", docs)
+
+    @pytest.mark.asyncio
+    async def test_mongodb_find_documents(self, mocker, tools_by_name, mock_context):
+        tool = tools_by_name["mongodb_find_documents"]
+        result = await tool(mock_context, "collection_a", {"name": "alice"})
+
+        assert isinstance(result, list)
+        assert len(result) == 2
+
+        result = await tool(
+            mock_context, "collection_a", {"name": "alice"},
+            projection={"name": 1}, limit=10, sort_field="name", sort_order=-1
+        )
+        assert isinstance(result, list)
+
+        mock_context.request_context.lifespan_context.connector.find_documents = \
+            mocker.AsyncMock(side_effect=RuntimeError())
+        with pytest.raises(ToolError):
+            await tool(mock_context, "collection_a", {"name": "alice"})
+
+    @pytest.mark.asyncio
+    async def test_mongodb_count_documents(self, mocker, tools_by_name, mock_context):
+        tool = tools_by_name["mongodb_count_documents"]
+        result = await tool(mock_context, "collection_a", {"name": "alice"})
+
+        assert "collection_a" in result
+        assert "Counted 2 documents" in result
+
+        mock_context.request_context.lifespan_context.connector.count_documents = \
+            mocker.AsyncMock(side_effect=RuntimeError())
+        with pytest.raises(ToolError):
+            await tool(mock_context, "collection_a", {"name": "alice"})
+
+    @pytest.mark.asyncio
+    async def test_mongodb_update_documents(self, mocker, tools_by_name, mock_context):
+        tool = tools_by_name["mongodb_update_documents"]
+        result = await tool(mock_context, "collection_a", {"name": "alice"}, {"$set": {"name": "alen"}})
+
+        assert "collection_a" in result
+        assert "Updated 2 documents" in result
+
+        result = await tool(mock_context, "collection_a", {"name": "alice"}, {"$set": {"name": "alen"}}, upsert=True)
+        assert "collection_a" in result
+
+        mock_context.request_context.lifespan_context.connector.update_documents = \
+            mocker.AsyncMock(side_effect=RuntimeError())
+        with pytest.raises(ToolError):
+            await tool(mock_context, "collection_a", {"name": "alice"}, {"$set": {"name": "alen"}})
+
+    @pytest.mark.asyncio
+    async def test_mongodb_replace_document(self, mocker, tools_by_name, mock_context):
+        tool = tools_by_name["mongodb_replace_document"]
+        result = await tool(mock_context, "collection_a", {"name": "alice"}, {"name": "alen", "age": 30})
+
+        assert "collection_a" in result
+        assert "Replaced 1 documents" in result
+
+        result = await tool(mock_context, "collection_a", {"name": "alice"}, {"name": "alen"}, upsert=True)
+        assert "collection_a" in result
+
+        mock_context.request_context.lifespan_context.connector.replace_document = \
+            mocker.AsyncMock(side_effect=RuntimeError())
+        with pytest.raises(ToolError):
+            await tool(mock_context, "collection_a", {"name": "alice"}, {"name": "alen"})
+
+    @pytest.mark.asyncio
+    async def test_mongodb_delete_documents(self, mocker, tools_by_name, mock_context):
+        tool = tools_by_name["mongodb_delete_documents"]
+        result = await tool(mock_context, "collection_a", {"name": "alice"})
+
+        assert "collection_a" in result
+        assert "Deleted 2 documents" in result
+
+        mock_context.request_context.lifespan_context.connector.delete_documents = \
+            mocker.AsyncMock(side_effect=RuntimeError())
+        with pytest.raises(ToolError):
+            await tool(mock_context, "collection_a", {"name": "alice"})
+
+    @pytest.mark.asyncio
+    async def test_mongodb_aggregate_documents(self, mocker, tools_by_name, mock_context):
+        tool = tools_by_name["mongodb_aggregate_documents"]
+        pipeline = [
+            {"$match": {"status": "active"}},
+            {"$group": {"_id": "$category", "count": {"$sum": 1}}}
+        ]
+        result = await tool(mock_context, "collection_a", pipeline)
+
+        assert isinstance(result, list)
+        assert len(result) == 2
+        assert result[0]["_id"] == "group_a"
+        assert result[0]["count"] == 5
+
+        result = await tool(mock_context, "collection_a", pipeline, {"allowDiskUse": True})
+        assert isinstance(result, list)
+        assert len(result) == 2
+
+        mock_context.request_context.lifespan_context.connector.aggregate_documents = \
+            mocker.AsyncMock(side_effect=RuntimeError())
+        with pytest.raises(ToolError):
+            await tool(mock_context, "collection_a", pipeline)
+
+    @pytest.mark.asyncio
+    async def test_mongodb_find_inspection_models(self, mocker, tools_by_name, mock_context):
+        tool = tools_by_name["mongodb_find_inspection_models"]
+        mock_context.request_context.lifespan_context.connector.find_inspection_models = \
+            mocker.AsyncMock(return_value=[{"_id": "1", "modelName": "EpoxyInspector"}])
+
+        result = await tool(mock_context, model_name="EpoxyInspector")
+        assert isinstance(result, list)
+        assert result[0]["modelName"] == "EpoxyInspector"
+
+        mock_context.request_context.lifespan_context.connector.find_inspection_models.assert_awaited_once()
+
+        mock_context.request_context.lifespan_context.connector.find_inspection_models = \
+            mocker.AsyncMock(side_effect=RuntimeError())
+        with pytest.raises(ToolError):
+            await tool(mock_context, model_name="EpoxyInspector")
