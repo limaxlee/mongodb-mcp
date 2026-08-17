@@ -8,9 +8,9 @@ from pymongo import TEXT, ASCENDING, DESCENDING
 from pymongo.errors import ConnectionFailure
 
 from common.config import SETTINGS
-from common.constants import LIMIT, CONNECTION_RETRIES, CONNECTION_DELAY, DBCollections
+from common.constants import LIMIT, CONNECTION_RETRIES, CONNECTION_DELAY, EXCLUDE_SAMPLES, DBCollections
 from mongodb_mcp.utils import preprocess_operation, process_query_result, generate_normalized_regex
-from mongodb_mcp.schemas import ServerStatus
+from mongodb_mcp.schemas import *
 
 logger = logging.getLogger(__name__)
 
@@ -38,41 +38,47 @@ class MongoDBConnector:
         self._db = self._client[db_name]
 
     @ensure_connection
-    async def list_databases(self) -> list[str]:
+    async def list_databases(self) -> ListDatabasesResult:
         try:
-            return await self._client.list_database_names()
+            databases = await self._client.list_database_names()
+            return ListDatabasesResult(databases=databases)
         except Exception as e:
             logger.exception(f"Failed to list databases: {str(e)}")
             raise
 
     @ensure_connection
-    async def list_collections(self) -> list[str]:
+    async def list_collections(self) -> ListCollectionsResult:
         try:
-            return await self._db.list_collection_names()
+            collections = await self._db.list_collection_names()
+            return ListCollectionsResult(collections=collections)
         except Exception as e:
             logger.exception(f"Failed to list collections: {str(e)}")
             raise
 
     @ensure_connection
-    async def create_collection(self, collection_name: str, **kwargs: Any):
+    async def create_collection(self, collection_name: str, **kwargs: Any) -> CreateCollectionResult:
         try:
             await self._db.create_collection(name=collection_name, **kwargs)
             logger.info(f"Created collection {collection_name}")
+
+            return CreateCollectionResult(collection_name=collection_name)
         except Exception as e:
             logger.exception(f"Failed to create collection {collection_name}: {str(e)}")
             raise
 
     @ensure_connection
-    async def drop_collection(self, collection_name: str):
+    async def drop_collection(self, collection_name: str) -> DropCollectionResult:
         try:
             await self._db.drop_collection(collection_name)
             logger.info(f"Dropped collection {collection_name}")
+
+            return DropCollectionResult(collection_name=collection_name)
         except Exception as e:
             logger.exception(f"Failed to drop collection {collection_name}: {str(e)}")
             raise
 
     @ensure_connection
-    async def rename_collection(self, collection_name: str, new_collection_name: str):
+    async def rename_collection(self, collection_name: str, new_collection_name: str) -> RenameCollectionResult:
         try:
             collections = await self._db.list_collection_names()
             if collection_name not in collections:
@@ -82,6 +88,8 @@ class MongoDBConnector:
 
             await self._db[collection_name].rename(new_collection_name)
             logger.info(f"Renamed collection {collection_name} to {new_collection_name}")
+
+            return RenameCollectionResult(collection_name=collection_name, new_collection_name=new_collection_name)
         except Exception as e:
             logger.exception(f"Failed to rename collection {collection_name} to {new_collection_name}: {str(e)}")
             raise
@@ -98,15 +106,16 @@ class MongoDBConnector:
             raise
 
     @ensure_connection
-    async def get_database_stats(self) -> dict[str, Any]:
+    async def get_database_stats(self) -> GetDatabaseStats:
         try:
-            return await self._db.command(command="dbStats")
+            database_stats = await self._db.command(command="dbStats")
+            return GetDatabaseStats(**database_stats)
         except Exception as e:
             logger.exception(f"Failed to get statistics information for a database: {str(e)}")
             raise
 
     @ensure_connection
-    async def list_indices(self, collection_name: str) -> list[Any]:
+    async def list_indices(self, collection_name: str) -> GetIndicesResult:
         try:
             if collection_name not in await self._db.list_collection_names():
                 raise ValueError(f"Collection {collection_name} doesn't exist")
@@ -114,13 +123,17 @@ class MongoDBConnector:
             indices = await self._db[collection_name].list_indexes().to_list(length=None)
             logger.info(f"Listed {len(indices)} indices for {collection_name} collection")
 
-            return indices
+            return GetIndicesResult(
+                collection_name=collection_name,
+                count=len(indices),
+                indices=[IndexInfo(**item) for item in indices]
+            )
         except Exception as e:
             logger.exception(f"Failed to list the indices for {collection_name} collection: {str(e)}")
             raise
 
     @ensure_connection
-    async def create_index(self, collection_name: str, keys: dict[str, Any], **kwargs: Any) -> str:
+    async def create_index(self, collection_name: str, keys: dict[str, Any], **kwargs: Any) -> CreateIndexResult:
         try:
             if collection_name not in await self._db.list_collection_names():
                 raise ValueError(f"Collection {collection_name} doesn't exist")
@@ -139,13 +152,13 @@ class MongoDBConnector:
             index_name = await self._db[collection_name].create_index(index_keys, **kwargs)
             logger.info(f"Created index {index_name} for {collection_name} collection")
 
-            return index_name
+            return CreateIndexResult(collection_name=collection_name, index=index_name)
         except Exception as e:
             logger.exception(f"Failed to create index for {collection_name} collection: {str(e)}")
             raise
 
     @ensure_connection
-    async def drop_index(self, collection_name: str, index_name: str):
+    async def drop_index(self, collection_name: str, index_name: str) -> DropIndexInfoResult:
         try:
             if collection_name not in await self._db.list_collection_names():
                 raise ValueError(f"Collection {collection_name} doesn't exist")
@@ -154,6 +167,8 @@ class MongoDBConnector:
 
             await self._db[collection_name].drop_index(index_name)
             logger.info(f"Dropped index {index_name} from {collection_name} collection")
+
+            return DropIndexInfoResult(collection_name=collection_name, index=index_name)
         except Exception as e:
             logger.exception(f"Failed to drop index {index_name} from {collection_name} collection: {str(e)}")
             raise
@@ -171,18 +186,18 @@ class MongoDBConnector:
             raise
 
     @ensure_connection
-    async def ping_database(self) -> dict[str, Any]:
+    async def ping_database(self) -> PingDatabaseResult:
         try:
             ping_result = await self._db.command(command="ping")
             logger.info(f"Pinged MongoDB database: {ping_result}")
 
-            return ping_result
+            return PingDatabaseResult(**ping_result)
         except Exception as e:
             logger.exception(f"Failed to ping MongoDB database: {str(e)}")
             raise
 
     @ensure_connection
-    async def insert_document(self, collection_name: str, document: dict[str, Any]) -> str:
+    async def insert_document(self, collection_name: str, document: dict[str, Any]) -> InsertDocumentResult:
         try:
             if collection_name not in await self._db.list_collection_names():
                 raise ValueError(f"Collection {collection_name} doesn't exist")
@@ -195,7 +210,7 @@ class MongoDBConnector:
                 logger.error(f"Failed to insert document into {collection_name} collection")
                 raise RuntimeError(f"Failed to insert document into {collection_name} collection")
 
-            return str(result.inserted_id)
+            return InsertDocumentResult(collection_name=collection_name, document_id=str(result.inserted_id))
         except Exception as e:
             logger.exception(f"Failed to insert document into {collection_name} collection: {str(e)}")
             raise
@@ -206,7 +221,7 @@ class MongoDBConnector:
             collection_name: str,
             documents: list[dict[str, Any]],
             ordered: bool = True
-    ) -> list[str]:
+    ) -> InsertManyDocumentsResult:
         try:
             if collection_name not in await self._db.list_collection_names():
                 raise ValueError(f"Collection {collection_name} doesn't exist")
@@ -219,7 +234,10 @@ class MongoDBConnector:
                 logger.error(f"Failed to insert documents into {collection_name} collection")
                 raise RuntimeError(f"Failed to insert documents into {collection_name} collection")
 
-            return [str(oid) for oid in result.inserted_ids]
+            return InsertManyDocumentsResult(
+                collection_name=collection_name,
+                document_ids=[str(oid) for oid in result.inserted_ids]
+            )
         except Exception as e:
             logger.exception(f"Failed to insert documents into {collection_name} collection: {str(e)}")
             raise
@@ -233,7 +251,7 @@ class MongoDBConnector:
             limit: int = LIMIT,
             sort_field: str | None = None,
             sort_order: int = ASCENDING
-    ) -> list[dict[str, Any]]:
+    ) -> FindDocumentsResult:
         try:
             if collection_name not in await self._db.list_collection_names():
                 raise ValueError(f"Collection {collection_name} doesn't exist")
@@ -246,13 +264,16 @@ class MongoDBConnector:
             documents = await cursor.to_list(length=limit)
             logger.info(f"Found {len(documents)} documents in {collection_name} collection using query {query}")
 
-            return [process_query_result(document) for document in documents]
+            return FindDocumentsResult(
+                collection_name=collection_name,
+                documents=[process_query_result(document) for document in documents]
+            )
         except Exception as e:
             logger.exception(f"Failed to find documents in {collection_name} collection using query {query}: {str(e)}")
             raise
 
     @ensure_connection
-    async def count_documents(self, collection_name: str, query: dict[str, Any]) -> int:
+    async def count_documents(self, collection_name: str, query: dict[str, Any]) -> CountDocumentsResult:
         try:
             if collection_name not in await self._db.list_collection_names():
                 raise ValueError(f"Collection {collection_name} doesn't exist")
@@ -261,7 +282,7 @@ class MongoDBConnector:
             document_count = await self._db[collection_name].count_documents(query)
             logger.info(f"Counted {document_count} documents in {collection_name} collection using query {query}")
 
-            return document_count
+            return CountDocumentsResult(collection_name=collection_name, document_count=document_count)
         except Exception as e:
             logger.exception(f"Failed to count documents in {collection_name} collection using query {query}: {str(e)}")
             raise
@@ -273,7 +294,7 @@ class MongoDBConnector:
             query: dict[str, Any],
             update_operation: dict[str, Any],
             upsert: bool = False
-    ) -> int:
+    ) -> UpdateDocumentsResult:
         try:
             if collection_name not in await self._db.list_collection_names():
                 raise ValueError(f"Collection {collection_name} doesn't exist")
@@ -290,7 +311,7 @@ class MongoDBConnector:
                 logger.error(error_message)
                 raise RuntimeError(error_message)
 
-            return result.modified_count
+            return UpdateDocumentsResult(collection_name=collection_name, updated_document_count=result.modified_count)
         except Exception as e:
             logger.exception(f"Failed to update documents in {collection_name} collection by query {query}: {str(e)}")
             raise
@@ -302,7 +323,7 @@ class MongoDBConnector:
             query: dict[str, Any],
             document: dict[str, Any],
             upsert: bool = False
-    ) -> int:
+    ) -> ReplaceDocumentResult:
         try:
             if collection_name not in await self._db.list_collection_names():
                 raise ValueError(f"Collection {collection_name} doesn't exist")
@@ -318,13 +339,13 @@ class MongoDBConnector:
                 logger.error(error_message)
                 raise RuntimeError(error_message)
 
-            return result.modified_count
+            return ReplaceDocumentResult(collection_name=collection_name, replaced_document_count=result.modified_count)
         except Exception as e:
             logger.exception(f"Failed to replace document in {collection_name} collection by query {query}: {str(e)}")
             raise
 
     @ensure_connection
-    async def delete_documents(self, collection_name: str, query: dict[str, Any]) -> int:
+    async def delete_documents(self, collection_name: str, query: dict[str, Any]) -> DeleteDocumentsResult:
         try:
             if collection_name not in await self._db.list_collection_names():
                 raise ValueError(f"Collection {collection_name} doesn't exist")
@@ -338,7 +359,7 @@ class MongoDBConnector:
                 logger.error(error_message)
                 raise RuntimeError(error_message)
 
-            return result.deleted_count
+            return DeleteDocumentsResult(collection_name=collection_name, deleted_document_count=result.deleted_count)
         except Exception as e:
             logger.exception(f"Failed to delete document in {collection_name} collection using query {query}: {str(e)}")
             raise
@@ -349,7 +370,7 @@ class MongoDBConnector:
             collection_name: str,
             pipeline: list[dict[str, Any]],
             options: dict[str, Any] | None = None
-    ) -> list[dict[str, Any]]:
+    ) -> AggregateDocumentsResult:
         try:
             if collection_name not in await self._db.list_collection_names():
                 raise ValueError(f"Collection {collection_name} doesn't exist")
@@ -363,7 +384,10 @@ class MongoDBConnector:
             documents = await cursor.to_list(length=None)
             logger.info(f"Executed aggregation pipeline with {len(documents)} results in {collection_name} collection")
 
-            return [process_query_result(document) for document in documents]
+            return AggregateDocumentsResult(
+                collection_name=collection_name,
+                documents=[process_query_result(document) for document in documents]
+            )
         except Exception as e:
             logger.exception(f"Failed to execute aggregation pipeline on {collection_name} collection: {str(e)}")
             raise
@@ -418,7 +442,7 @@ class MongoDBConnector:
             limit: int = LIMIT,
             sort_field: str | None = None,
             sort_order: int = ASCENDING
-    ) -> list[dict[str, Any]]:
+    ) -> FindInspectionModelsResult:
         try:
             query = self._build_inspection_query(
                 model_name=model_name,
@@ -441,9 +465,72 @@ class MongoDBConnector:
             documents = await cursor.to_list(length=limit)
             logger.info(f"Found {len(documents)} model documents using query {query}")
 
-            return [process_query_result(document) for document in documents]
+            return FindInspectionModelsResult(
+                models=[InspectionModelInfo(**process_query_result(document)) for document in documents]
+            )
         except Exception as e:
             logger.exception(f"Failed to find inspection models: {str(e)}")
+            raise
+
+    @ensure_connection
+    async def find_inspection_summaries(
+            self,
+            model_name: str | None = None,
+            model_version: str | None = None,
+            gbm: str | None = None,
+            task: str | None = None,
+            mode: str | None = None,
+            process: str | None = None,
+            location: str | None = None,
+            equipment_id: str | None = None,
+            product_id: str | None = None,
+            conclusion: str | None = None,
+            start_date: datetime | None = None,
+            end_date: datetime | None = None,
+            projection: dict[str, Any] | None = None,
+            limit: int = LIMIT,
+            sort_field: str | None = None,
+            sort_order: int = ASCENDING
+    ) -> FindInspectionSummariesResult:
+        try:
+            query = self._build_inspection_query(
+                model_name=model_name,
+                model_version=model_version,
+                gbm=gbm,
+                task=task,
+                mode=mode,
+                process=process,
+                start_date=start_date,
+                end_date=end_date
+            )
+
+            if location:
+                query["location"] = generate_normalized_regex(location)
+            if equipment_id:
+                query["equipmentId"] = equipment_id
+            if product_id:
+                query["productId"] = product_id
+            if conclusion:
+                query["conclusion"] = conclusion
+
+            if DBCollections.INSPECTIONS_SUMMARY not in await self._db.list_collection_names():
+                raise ValueError(f"Collection {DBCollections.INSPECTIONS_SUMMARY} doesn't exist")
+
+            cursor = self._db[DBCollections.INSPECTIONS_SUMMARY].find(
+                query,
+                projection=projection if projection is not None else EXCLUDE_SAMPLES
+            )
+            if sort_field:
+                cursor = cursor.sort(sort_field, sort_order)
+
+            documents = await cursor.to_list(length=limit)
+            logger.info(f"Found {len(documents)} summary documents using query {query}")
+
+            return FindInspectionSummariesResult(
+                summaries=[InspectionSummaryInfo(**process_query_result(document)) for document in documents]
+            )
+        except Exception as e:
+            logger.exception(f"Failed to find inspection summaries: {str(e)}")
             raise
 
     @ensure_connection

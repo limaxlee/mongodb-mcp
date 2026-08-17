@@ -2,7 +2,9 @@ import sys
 import yaml
 import pytest
 import pathlib
+from datetime import datetime
 
+from common.constants import DBCollections
 from mongodb_mcp.connector.connector import MongoDBConnector
 
 ROOT_DIR = pathlib.Path(__file__).resolve().parent.parent
@@ -71,6 +73,7 @@ def mock_async_mongodb_db(mocker):
     db.command = mocker.AsyncMock(return_value={
         "db": "testDb",
         "collections": 10,
+        "views": 0,
         "objects": 9000,
         "avObjSize": 327.23,
         "dataSize": 300144,
@@ -135,7 +138,86 @@ def mock_async_mongodb_db(mocker):
     collection_a.replace_one = mocker.AsyncMock(return_value=replace_result)
     collection_a.delete_many = mocker.AsyncMock(return_value=delete_result)
     collection_a.aggregate = mocker.MagicMock(return_value=aggregate_cursor)
-    db.__getitem__.side_effect = lambda name: collection_a
+
+    daily_models_cursor = mocker.MagicMock(name="DailyModelsCursor")
+    daily_models_cursor.sort = mocker.MagicMock(return_value=daily_models_cursor)
+    daily_models_cursor.to_list = mocker.AsyncMock(return_value=[
+        {
+            "_id": "507f1f77bcf86cd799439011",
+            "modelName": "EpoxyModel",
+            "modelVersion": "v1",
+            "process": "ActiveAlign",
+            "task": "cls",
+            "gbm": "SEV",
+            "mode": "test",
+            "date": datetime(2026, 1, 1)
+        },
+        {
+            "_id": "507f1f77bcf86cd799439012",
+            "modelName": "EpoxyModel",
+            "modelVersion": "v2",
+            "process": "ActiveAlign",
+            "task": "cls",
+            "gbm": "SEV",
+            "mode": "test",
+            "date": datetime(2026, 2, 1)
+        }
+    ])
+
+    daily_models = mocker.MagicMock(name="DailyModelsCollectionMocker")
+    daily_models.find = mocker.MagicMock(return_value=daily_models_cursor)
+
+    summaries_cursor = mocker.MagicMock(name="InspectionsSummaryCursor")
+    summaries_cursor.sort = mocker.MagicMock(return_value=summaries_cursor)
+    summaries_cursor.to_list = mocker.AsyncMock(return_value=[
+        {
+            "_id": "507f1f77bcf86cd799439021",
+            "schemaVersion": "1.0",
+            "modelName": "EpoxyModel",
+            "modelVersion": "v1",
+            "gbm": "SEV",
+            "process": "ActiveAlign",
+            "mode": "test",
+            "date": datetime(2026, 1, 1),
+            "location": "Line 1",
+            "equipmentId": "EQ-01",
+            "productId": "PR-01",
+            "localTimezone": "Asia/Seoul",
+            "inspectionIds": ["insp_1", "insp_2"],
+            "task": "classification",
+            "classes": ["Good", "Bad"],
+            "conclusion": "Good",
+            "threshold": 0.7,
+            "statistics": {
+                "dataCount": {"Good": 8, "Bad": 2},
+                "confidence": {
+                    "Good": {"avg": 0.9, "min": 0.8, "max": 0.99, "sum": 7.2},
+                    "Bad": {"avg": 0.75, "min": 0.7, "max": 0.8, "sum": 1.5}
+                },
+                "elapsedTime": {"avg": 0.05, "min": 0.01, "max": 0.12, "sum": 0.5}
+            }
+        },
+        {
+            "_id": "507f1f77bcf86cd799439022",
+            "modelName": "EpoxyModel",
+            "modelVersion": "v2",
+            "gbm": "SEV",
+            "process": "ActiveAlign",
+            "date": datetime(2026, 2, 1),
+            "location": "Line 2",
+            "equipmentId": "EQ-02",
+            "task": "classification"
+        }
+    ])
+
+    summaries = mocker.MagicMock(name="InspectionsSummaryCollectionMocker")
+    summaries.find = mocker.MagicMock(return_value=summaries_cursor)
+
+    collections_by_name = {
+        DBCollections.DAILY_MODELS: daily_models,
+        DBCollections.INSPECTIONS_SUMMARY: summaries
+    }
+    db.__getitem__.side_effect = lambda name: collections_by_name.get(name, collection_a)
 
     return db
 

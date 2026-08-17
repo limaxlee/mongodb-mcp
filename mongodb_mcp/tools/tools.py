@@ -6,7 +6,7 @@ from fastmcp.exceptions import ToolError
 from fastmcp.server import Context, FastMCP
 
 from common.constants import LIMIT
-from mongodb_mcp.schemas import ServerStatus
+from mongodb_mcp.schemas import *
 
 logger = logging.getLogger(__name__)
 
@@ -14,23 +14,31 @@ tools_mcp = FastMCP(name="tools")
 
 
 @tools_mcp.tool()
-async def mongodb_list_databases(ctx: Context) -> str:
-    """List all databases in the MongoDB"""
+async def mongodb_list_databases(ctx: Context) -> ListDatabasesResult:
+    """List all databases in the MongoDB
+
+    Returns:
+        Database list with the following fields:
+            databases: Names of every database in the MongoDB
+    """
     try:
         connector = ctx.request_context.lifespan_context.connector
-        databases = await connector.list_databases()
-        return f"Databases in MongoDB:\n{', '.join(databases)}"
+        return await connector.list_databases()
     except Exception as e:
         raise ToolError(f"Failed to list databases: {str(e)}")
 
 
 @tools_mcp.tool()
-async def mongodb_list_collections(ctx: Context) -> str:
-    """List all collections in the database"""
+async def mongodb_list_collections(ctx: Context) -> ListCollectionsResult:
+    """List all collections in the database
+
+    Returns:
+        Collection list with the following fields:
+            collections: Names of every collection in the configured database
+    """
     try:
         connector = ctx.request_context.lifespan_context.connector
-        collections = await connector.list_collections()
-        return f"Collections in database:\n{', '.join(collections)}"
+        return await connector.list_collections()
     except Exception as e:
         raise ToolError(f"Failed to list collections: {str(e)}")
 
@@ -40,54 +48,71 @@ async def mongodb_create_collection(
         ctx: Context,
         collection_name: str,
         options: dict[str, Any] | None = None
-) -> str:
+) -> CreateCollectionResult:
     """Create a new collection with optional settings
 
     Args:
         collection_name: Name of the collection to create
         options: Additional keyword arguments for the collection creation
+
+    Returns:
+        Collection creation result with the following fields:
+            collection_name: Name of the created collection
+            collection_created: Always true, a failed creation raises error instead
     """
     try:
         connector = ctx.request_context.lifespan_context.connector
-        await connector.create_collection(
+        return await connector.create_collection(
             collection_name=collection_name,
             **(options if options is not None else {})
         )
-
-        return f"Collection {collection_name} created successfully"
     except Exception as e:
         raise ToolError(f"Failed to create collection {collection_name}: {str(e)}")
 
 
 @tools_mcp.tool()
-async def mongodb_drop_collection(ctx: Context, collection_name: str) -> str:
+async def mongodb_drop_collection(ctx: Context, collection_name: str) -> DropCollectionResult:
     """Delete a collection from the database
 
     Args:
         collection_name: Name of the collection to delete
+
+    Returns:
+        Collection drop result with the following fields:
+            collection_name: Name of the dropped collection
+            collection_dropped: Always true, a failed drop raises error instead
     """
     try:
         connector = ctx.request_context.lifespan_context.connector
-        await connector.drop_collection(collection_name=collection_name)
-
-        return f"Collection {collection_name} dropped successfully"
+        return await connector.drop_collection(collection_name=collection_name)
     except Exception as e:
         raise ToolError(f"Failed to drop collection {collection_name}: {str(e)}")
 
 
 @tools_mcp.tool()
-async def mongodb_rename_collection(ctx: Context, collection_name: str, new_collection_name: str) -> str:
+async def mongodb_rename_collection(
+        ctx: Context,
+        collection_name: str,
+        new_collection_name: str
+) -> RenameCollectionResult:
     """Rename a collection
 
     Args:
         collection_name: Current name of the collection
         new_collection_name: New name for the collection
+
+    Returns:
+        Collection rename result with the following fields:
+            collection_name: Previous name of the collection
+            new_collection_name: New name of the collection
+            collection_renamed: Always true, a failed rename raises error instead
     """
     try:
         connector = ctx.request_context.lifespan_context.connector
-        await connector.rename_collection(collection_name=collection_name, new_collection_name=new_collection_name)
-
-        return f"Successfully renamed collection {collection_name} to {new_collection_name}"
+        return await connector.rename_collection(
+            collection_name=collection_name,
+            new_collection_name=new_collection_name
+        )
     except Exception as e:
         raise ToolError(f"Failed to rename collection {collection_name}: {str(e)}")
 
@@ -98,6 +123,19 @@ async def mongodb_get_collection_stats(ctx: Context, collection_name: str) -> di
 
     Args:
         collection_name: Name of the collection
+
+    Returns:
+        Raw collStats document returned by MongoDB, whose fields vary by server version and storage engine,
+        commonly including:
+            ns: Namespace of the collection, in the form of database.collection
+            count: Number of documents in the collection
+            size: Total uncompressed size of the documents in bytes
+            avgObjSize: Average uncompressed size of a document in bytes
+            storageSize: Total size allocated for the collection on disk in bytes
+            nindexes: Number of indexes on the collection
+            totalIndexSize: Total size of all indexes on the collection in bytes
+            indexSizes: Size of each index in bytes, keyed by index name
+            ok: 1 when the command succeeded
     """
     try:
         connector = ctx.request_context.lifespan_context.connector
@@ -107,8 +145,23 @@ async def mongodb_get_collection_stats(ctx: Context, collection_name: str) -> di
 
 
 @tools_mcp.tool()
-async def mongodb_get_database_stats(ctx: Context) -> dict[str, Any]:
-    """Get statistics information for a database"""
+async def mongodb_get_database_stats(ctx: Context) -> GetDatabaseStats:
+    """Get statistics information for a database
+
+    Returns:
+        Database statistics with the following fields:
+            db: Name of the database
+            collections: Number of collections in the database
+            views: Number of views in the database
+            objects: Number of documents across all collections in the database
+            indexes: Number of indexes across all collections in the database
+            indexSize: Total size of all indexes in bytes
+            totalSize: Total size of all collections and indexes in bytes
+            scaleFactor: Scale factor the reported sizes are divided by
+            fsUsedSize: Used size of the filesystem the database is stored on in bytes
+            fsTotalSize: Total size of the filesystem the database is stored on in bytes
+            ok: 1 when the command succeeded
+    """
     try:
         connector = ctx.request_context.lifespan_context.connector
         return await connector.get_database_stats()
@@ -117,21 +170,25 @@ async def mongodb_get_database_stats(ctx: Context) -> dict[str, Any]:
 
 
 @tools_mcp.tool()
-async def mongodb_list_indices(ctx: Context, collection_name: str) -> dict[str, Any]:
+async def mongodb_list_indices(ctx: Context, collection_name: str) -> GetIndicesResult:
     """List all indices for the specified collection
 
     Args:
         collection_name: Name of the collection
+
+    Returns:
+        Index list with the following fields:
+            collection_name: Name of the collection the indices belong to
+            count: Number of indices on the collection
+            indices: List of indices, each with the following fields:
+                v: Version of the index
+                key: Index key specification, mapping each indexed field to its direction or index type
+                  (e.g. 1, -1, "text", "2dsphere", "hashed")
+                name: Name of the index
     """
     try:
         connector = ctx.request_context.lifespan_context.connector
-        result = await connector.list_indices(collection_name=collection_name)
-
-        return {
-            "collection": collection_name,
-            "count": len(result),
-            "indices": result
-        }
+        return await connector.list_indices(collection_name=collection_name)
     except Exception as e:
         raise ToolError(f"Failed to list the indices for {collection_name} collection: {str(e)}")
 
@@ -142,47 +199,74 @@ async def mongodb_create_index(
         collection_name: str,
         keys: dict[str, Any],
         options: dict[str, Any] | None = None
-) -> str:
+) -> CreateIndexResult:
     """Create an index on the specified collection
 
     Args:
         collection_name: Name of the collection to create
         keys: Index key specification (e.g., {"field": 1} for ascending)
         options: Additional keyword arguments for the index creation
+
+    Returns:
+        Index creation result with the following fields:
+            collection_name: Name of the collection the index was created on
+            index: Name of the created index
+            index_created: Always true, a failed creation raises error instead
     """
     try:
         connector = ctx.request_context.lifespan_context.connector
-        result = await connector.create_index(
+        return await connector.create_index(
             collection_name=collection_name,
             keys=keys,
             **(options if options is not None else {})
         )
-
-        return f"Created index {result} for {collection_name} collection"
     except Exception as e:
         raise ToolError(f"Failed to create index for {collection_name} collection: {str(e)}")
 
 
 @tools_mcp.tool()
-async def mongodb_drop_index(ctx: Context, collection_name: str, index_name: str) -> str:
+async def mongodb_drop_index(ctx: Context, collection_name: str, index_name: str) -> DropIndexInfoResult:
     """Drop an index from the specified collection
 
     Args:
         collection_name: Name of the collection
         index_name: Name of the index to drop
+
+    Returns:
+        Index drop result with the following fields:
+            collection_name: Name of the collection the index was dropped from
+            index: Name of the dropped index
+            index_dropped: Always true, a failed drop raises error instead
     """
     try:
         connector = ctx.request_context.lifespan_context.connector
-        await connector.drop_index(collection_name=collection_name, index_name=index_name)
-
-        return f"Dropped index {index_name} from {collection_name} collection"
+        return await connector.drop_index(collection_name=collection_name, index_name=index_name)
     except Exception as e:
         raise ToolError(f"Failed to drop index {index_name} from {collection_name} collection: {str(e)}")
 
 
 @tools_mcp.tool()
 async def mongodb_get_server_status(ctx: Context) -> ServerStatus:
-    """Get MongoDB server status information"""
+    """Get MongoDB server status information
+
+    Returns:
+        Server status with the following fields, each empty when the server did not report it:
+            host: Hostname and port of the server
+            version: Version of the server
+            process: Process serving the request (e.g. "mongod", "mongos")
+            pid: Process id of the server
+            uptime: Uptime of the server in seconds
+            uptimeMillis: Uptime of the server in milliseconds
+            localTime: Current time of the server in UTC
+            connections: Connection statistics with the following fields:
+                current: Number of currently open incoming connections
+                available: Number of incoming connections still available
+                totalCreated: Number of connections created since the server started
+            extra_info: Platform specific statistics with the following fields:
+                note: Note the server attaches to the platform specific statistics
+                heap_usage_bytes: Heap space used by the server process in bytes
+                page_faults: Number of page faults since the server started
+    """
     try:
         connector = ctx.request_context.lifespan_context.connector
         return await connector.get_server_status()
@@ -191,8 +275,13 @@ async def mongodb_get_server_status(ctx: Context) -> ServerStatus:
 
 
 @tools_mcp.tool()
-async def mongodb_ping_database(ctx: Context) -> dict[str, Any]:
-    """Test database connection"""
+async def mongodb_ping_database(ctx: Context) -> PingDatabaseResult:
+    """Test database connection
+
+    Returns:
+        Ping result with the following fields:
+            ok: 1 when the database answered the ping, an unreachable database raises error instead
+    """
     try:
         connector = ctx.request_context.lifespan_context.connector
         return await connector.ping_database()
@@ -201,18 +290,22 @@ async def mongodb_ping_database(ctx: Context) -> dict[str, Any]:
 
 
 @tools_mcp.tool()
-async def mongodb_insert_document(ctx: Context, collection_name: str, document: dict[str, Any]) -> str:
+async def mongodb_insert_document(ctx: Context, collection_name: str, document: dict[str, Any]) -> InsertDocumentResult:
     """Insert a document into the specified collection
 
     Args:
         collection_name: Name of the collection
         document: Document to insert (JSON-compatible dictionary)
+
+    Returns:
+        Insert result with the following fields:
+            collection_name: Name of the collection the document was inserted into
+            document_id: Id assigned to the inserted document
+            document_inserted: Always true, a failed insert raises error instead
     """
     try:
         connector = ctx.request_context.lifespan_context.connector
-        result = await connector.insert_document(collection_name=collection_name, document=document)
-
-        return f"Inserted document with id {result} into {collection_name} collection"
+        return await connector.insert_document(collection_name=collection_name, document=document)
     except Exception as e:
         raise ToolError(f"Failed to insert document into {collection_name} collection: {str(e)}")
 
@@ -223,23 +316,27 @@ async def mongodb_insert_many_documents(
         collection_name: str,
         documents: list[dict[str, Any]],
         ordered: bool = True
-) -> str:
+) -> InsertManyDocumentsResult:
     """Insert multiple documents into the specified collection
 
     Args:
         collection_name: Name of the collection
         documents: List of documents to insert (list of JSON-compatible dictionary)
         ordered: Whether to perform ordered or unordered inserts
+
+    Returns:
+        Insert result with the following fields:
+            collection_name: Name of the collection the documents were inserted into
+            document_ids: Ids assigned to the inserted documents, in the order they were given
+            documents_inserted: Always true, a failed insert raises error instead
     """
     try:
         connector = ctx.request_context.lifespan_context.connector
-        result = await connector.insert_many_documents(
+        return await connector.insert_many_documents(
             collection_name=collection_name,
             documents=documents,
             ordered=ordered
         )
-
-        return f"Inserted documents into {collection_name} collection with ids: {result}"
     except Exception as e:
         raise ToolError(f"Failed to insert documents into {collection_name} collection: {str(e)}")
 
@@ -253,7 +350,7 @@ async def mongodb_find_documents(
         limit: int = LIMIT,
         sort_field: str | None = None,
         sort_order: int = ASCENDING
-) -> list[dict[str, Any]]:
+) -> FindDocumentsResult:
     """Find documents in the specified collection matching the query
 
     Args:
@@ -263,6 +360,11 @@ async def mongodb_find_documents(
         limit: Maximum number of documents to return (5 is default)
         sort_field: Field name to sort results based on
         sort_order: Result sorting order
+
+    Returns:
+        Find result with the following fields:
+            collection_name: Name of the searched collection
+            documents: Matching documents with their ids as strings, empty when the query matched nothing
     """
     try:
         connector = ctx.request_context.lifespan_context.connector
@@ -279,18 +381,21 @@ async def mongodb_find_documents(
 
 
 @tools_mcp.tool()
-async def mongodb_count_documents(ctx: Context, collection_name: str, query: dict[str, Any]) -> str:
+async def mongodb_count_documents(ctx: Context, collection_name: str, query: dict[str, Any]) -> CountDocumentsResult:
     """Count documents in the specified collection matching the query
 
     Args:
         collection_name: Name of the collection
         query: Document query filter
+
+    Returns:
+        Count result with the following fields:
+            collection_name: Name of the counted collection
+            document_count: Number of documents matching the query
     """
     try:
         connector = ctx.request_context.lifespan_context.connector
-        result = await connector.count_documents(collection_name=collection_name, query=query)
-
-        return f"Counted {result} documents in {collection_name} collection"
+        return await connector.count_documents(collection_name=collection_name, query=query)
     except Exception as e:
         raise ToolError(f"Failed to count documents in {collection_name} collection using query {query}: {str(e)}")
 
@@ -302,7 +407,7 @@ async def mongodb_update_documents(
         query: dict[str, Any],
         update_operation: dict[str, Any],
         upsert: bool = False
-) -> str:
+) -> UpdateDocumentsResult:
     """Update documents in the specified collection matching the query
 
     Args:
@@ -310,17 +415,20 @@ async def mongodb_update_documents(
         query: Document query filter
         update_operation: Update operation document (must include operators like $set)
         upsert: Whether to insert if no document matches the query
+
+    Returns:
+        Update result with the following fields:
+            collection_name: Name of the updated collection
+            updated_document_count: Number of documents modified by the update operation
     """
     try:
         connector = ctx.request_context.lifespan_context.connector
-        result = await connector.update_documents(
+        return await connector.update_documents(
             collection_name=collection_name,
             query=query,
             update_operation=update_operation,
             upsert=upsert
         )
-
-        return f"Updated {result} documents in {collection_name} collection"
     except Exception as e:
         raise ToolError(f"Failed to update documents in {collection_name} collection: {str(e)}")
 
@@ -332,7 +440,7 @@ async def mongodb_replace_document(
         query: dict[str, Any],
         document: dict[str, Any],
         upsert: bool = False
-) -> str:
+) -> ReplaceDocumentResult:
     """Replace a single document in the specified collection matching the query
 
     Args:
@@ -340,33 +448,40 @@ async def mongodb_replace_document(
         query: Document query filter
         document: Replacement document (should not contain update operators)
         upsert: Whether to insert if no document matches the query
+
+    Returns:
+        Replace result with the following fields:
+            collection_name: Name of the collection the document was replaced in
+            replaced_document_count: Number of documents replaced by the operation
     """
     try:
         connector = ctx.request_context.lifespan_context.connector
-        result = await connector.replace_document(
+        return await connector.replace_document(
             collection_name=collection_name,
             query=query,
             document=document,
             upsert=upsert
         )
-
-        return f"Replaced {result} documents in {collection_name} collection"
     except Exception as e:
         raise ToolError(f"Failed to replace document in {collection_name} collection by query {query}: {str(e)}")
 
 
 @tools_mcp.tool()
-async def mongodb_delete_documents(ctx: Context, collection_name: str, query: dict[str, Any]) -> str:
+async def mongodb_delete_documents(ctx: Context, collection_name: str, query: dict[str, Any]) -> DeleteDocumentsResult:
     """Delete document from the specified collection matching the query
+
     Args:
         collection_name: Name of the collection
         query: Document query filter
+
+    Returns:
+        Delete result with the following fields:
+            collection_name: Name of the collection the documents were deleted from
+            deleted_document_count: Number of documents deleted by the operation
     """
     try:
         connector = ctx.request_context.lifespan_context.connector
-        result = await connector.delete_documents(collection_name=collection_name, query=query)
-
-        return f"Deleted {result} documents in {collection_name} collection"
+        return await connector.delete_documents(collection_name=collection_name, query=query)
     except Exception as e:
         raise ToolError(f"Failed to delete documents in {collection_name} collection using query {query}: {str(e)}")
 
@@ -377,23 +492,27 @@ async def mongodb_aggregate_documents(
         collection_name: str,
         pipeline: list[dict[str, Any]],
         options: dict[str, Any] | None = None
-):
+) -> AggregateDocumentsResult:
     """Execute an aggregation pipeline on the specified collection
 
     Args:
         collection_name: Name of the collection
         pipeline: MongoDB aggregation pipeline (list of stage dictionaries)
         options: Aggregation options (allowDiskUse, maxTimeMS, etc.)
+
+    Returns:
+        Aggregation result with the following fields:
+            collection_name: Name of the aggregated collection
+            documents: Documents produced by the pipeline with their ids as strings, empty when the pipeline
+              produced nothing
     """
     try:
         connector = ctx.request_context.lifespan_context.connector
-        result = await connector.aggregate_documents(
+        return await connector.aggregate_documents(
             collection_name=collection_name,
             pipeline=pipeline,
             options=options
         )
-
-        return result
     except Exception as e:
         raise ToolError(f"Failed to execute aggregation pipeline on {collection_name} collection: {str(e)}")
 
@@ -413,7 +532,7 @@ async def mongodb_find_inspection_models(
         limit: int = LIMIT,
         sort_field: str | None = None,
         sort_order: int = ASCENDING
-) -> list[dict[str, Any]]:
+) -> FindInspectionModelsResult:
     """Find inspection models with optional filters
 
     All filter arguments are optional. Omit any you don't want to filter on.
@@ -431,6 +550,18 @@ async def mongodb_find_inspection_models(
         limit: Maximum number of documents to return (5 is default)
         sort_field: Field name to sort results based on
         sort_order: Result sorting order
+
+    Returns:
+        Inspection model list with the following fields:
+            models: Matching inspection models, empty when the filters matched nothing, each with the
+              following fields:
+                modelName: Name of the inspection model
+                modelVersion: Version of the inspection model
+                process: Process line where the model was deployed
+                task: Task the inspection model performs
+                gbm: Manufacturing site where the model was deployed
+                mode: Operating mode of the inspection model
+                date: Deployment date of the inspection model
     """
     try:
         connector = ctx.request_context.lifespan_context.connector
@@ -450,3 +581,99 @@ async def mongodb_find_inspection_models(
         )
     except Exception as e:
         raise ToolError(f"Failed to find inspection models: {str(e)}")
+
+
+@tools_mcp.tool()
+async def mongodb_find_inspection_summaries(
+        ctx: Context,
+        model_name: str | None = None,
+        model_version: str | None = None,
+        gbm: str | None = None,
+        task: str | None = None,
+        mode: str | None = None,
+        process: str | None = None,
+        location: str | None = None,
+        equipment_id: str | None = None,
+        product_id: str | None = None,
+        conclusion: str | None = None,
+        start_date: datetime | None = None,
+        end_date: datetime | None = None,
+        projection: dict[str, Any] | None = None,
+        limit: int = LIMIT,
+        sort_field: str | None = None,
+        sort_order: int = ASCENDING
+) -> FindInspectionSummariesResult:
+    """Find inspection summaries with optional filters
+
+    All filter arguments are optional. Omit any you don't want to filter on. The per data sample details of an
+    inspection are left out of the results, only the statistics aggregated over them are returned.
+
+    Args:
+        model_name: Name of the inspection model the summary was produced by
+        model_version: Version of the inspection model the summary was produced by
+        gbm: Manufacturing site where the inspection ran
+        task: Task the inspection model performs
+        mode: Operating mode the inspection ran in
+        process: Process line where the inspection ran
+        location: Location within the process line where the inspection ran
+        equipment_id: Id of the equipment the inspection ran on
+        product_id: Id of the inspected product
+        conclusion: Conclusion the inspection arrived at
+        start_date: Lower range for inspection date
+        end_date: Upper range for inspection date
+        projection: Projection (fields to include/exclude), samples are excluded when omitted
+        limit: Maximum number of documents to return (5 is default)
+        sort_field: Field name to sort results based on
+        sort_order: Result sorting order
+
+    Returns:
+        Inspection summary list with the following fields:
+            summaries: Matching inspection summaries, empty when the filters matched nothing, each with the
+              following fields:
+                schemaVersion: Version of the inspection summary schema
+                modelName: Name of the inspection model the summary was produced by
+                modelVersion: Version of the inspection model the summary was produced by
+                gbm: Manufacturing site where the inspection ran
+                process: Process line where the inspection ran
+                mode: Operating mode the inspection ran in
+                date: Date the inspection ran on
+                location: Location within the process line where the inspection ran
+                equipmentId: Id of the equipment the inspection ran on
+                productId: Id of the inspected product
+                localTimezone: Timezone of the site the inspection ran on
+                inspectionIds: Ids of the inspections the summary aggregates
+                task: Task the inspection model performs
+                classes: Prediction classes the inspection model can output
+                conclusion: Conclusion the inspection arrived at
+                threshold: Confidence threshold the inspection decided with
+                statistics: Statistics aggregated over the inspected data samples, with the following fields:
+                    dataCount: Number of inspected data samples per prediction class
+                    confidence: Confidence statistics per prediction class, each with the following fields:
+                        avg: Average confidence of the class
+                        min: Lowest confidence of the class
+                        max: Highest confidence of the class
+                        sum: Total confidence of the class
+                    elapsedTime: Inference time statistics in seconds, with the same fields as confidence
+    """
+    try:
+        connector = ctx.request_context.lifespan_context.connector
+        return await connector.find_inspection_summaries(
+            model_name=model_name,
+            model_version=model_version,
+            gbm=gbm,
+            task=task,
+            mode=mode,
+            process=process,
+            location=location,
+            equipment_id=equipment_id,
+            product_id=product_id,
+            conclusion=conclusion,
+            start_date=start_date,
+            end_date=end_date,
+            projection=projection,
+            limit=limit,
+            sort_field=sort_field,
+            sort_order=sort_order
+        )
+    except Exception as e:
+        raise ToolError(f"Failed to find inspection summaries: {str(e)}")
