@@ -1,6 +1,6 @@
 from .database import ListDatabasesResult, GetDatabaseStats, PingDatabaseResult
 from .collection import (
-    ListCollectionsResult, CreateCollectionResult, DropCollectionResult,
+    ListCollectionsResult, CreateCollectionResult, DropCollectionResult, GetCollectionStatsResult,
     RenameCollectionResult, GetIndicesResult, IndexInfo, CreateIndexResult, DropIndexInfoResult
 )
 from .crud import (
@@ -9,6 +9,14 @@ from .crud import (
 )
 from .status import ServerStatus
 from .inspections import (
-    FindInspectionModelsResult, InspectionModelInfo, FindInspectionSummariesResult, InspectionSummaryInfo,
-    InspectionStatistics, ValueStats
+    FindInspectionModelsResult, InspectionModelInfo,
+    FindInspectionSummaryDocumentsResult, InspectionSummaryDocument, Statistics
+)
+from .datasets import (
+    AccessControl, FamilyMember, DatasetFamilyDocument, FindDatasetFamilyDocumentsResult,
+    LabelAttributes, TrainingRecord, DatasetDocument, FindDatasetDocumentsResult
+)
+from .drift import (
+    DriftAnalysisResult, BucketSummary, BoxSummary, SplitComparison, SideSummary, TrendStat, OutlierBucket,
+    HardBreak, DataQuality, AnalysisStatus, DateRange, KsResult, Chi2Result, ConfQuantiles, Quantiles, PairwiseMax
 )

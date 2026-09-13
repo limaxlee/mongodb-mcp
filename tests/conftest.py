@@ -11,6 +11,25 @@ ROOT_DIR = pathlib.Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
+from tests.drift.synthetic import generate_rows, cls_prediction  # noqa: E402
+
+# Seven days of classification rows with a confidence drop on day four, as the drift pipeline would emit them
+DRIFT_ROWS = generate_rows("cls", 7, 300, lambda rng, day: cls_prediction(rng, 0.93 if day < 4 else 0.84, 0.02))
+
+
+class AsyncRowCursor:
+    """Stands in for a motor aggregation cursor, which is iterated with async for"""
+
+    def __init__(self, rows):
+        self.rows = rows
+
+    def __aiter__(self):
+        return self._iterate()
+
+    async def _iterate(self):
+        for row in self.rows:
+            yield row
+
 
 def pytest_configure(config):
     cfg = ROOT_DIR / "config.yaml"
@@ -72,7 +91,13 @@ def mock_async_mongodb_db(mocker):
     db.drop_collection = mocker.AsyncMock(return_value=None)
     db.command = mocker.AsyncMock(return_value={
         "db": "testDb",
+        "ns": "testDb",
         "collections": 10,
+        "size": 111,
+        "count": 3,
+        "freeStorageSize": 16384,
+        "avgObjSize": 37,
+        "capped": True,
         "views": 0,
         "objects": 9000,
         "avObjSize": 327.23,
@@ -167,12 +192,11 @@ def mock_async_mongodb_db(mocker):
     daily_models = mocker.MagicMock(name="DailyModelsCollectionMocker")
     daily_models.find = mocker.MagicMock(return_value=daily_models_cursor)
 
-    summaries_cursor = mocker.MagicMock(name="InspectionsSummaryCursor")
+    summaries_cursor = mocker.MagicMock(name="InspectionsSummaryMocker")
     summaries_cursor.sort = mocker.MagicMock(return_value=summaries_cursor)
     summaries_cursor.to_list = mocker.AsyncMock(return_value=[
         {
             "_id": "507f1f77bcf86cd799439021",
-            "schemaVersion": "1.0",
             "modelName": "EpoxyModel",
             "modelVersion": "v1",
             "gbm": "SEV",
@@ -183,10 +207,9 @@ def mock_async_mongodb_db(mocker):
             "equipmentId": "EQ-01",
             "productId": "PR-01",
             "localTimezone": "Asia/Seoul",
-            "inspectionIds": ["insp_1", "insp_2"],
-            "task": "classification",
+            "inspectionIds": ["inspection-id1", "inspection-id2"],
+            "task": "cls",
             "classes": ["Good", "Bad"],
-            "conclusion": "Good",
             "threshold": 0.7,
             "statistics": {
                 "dataCount": {"Good": 8, "Bad": 2},
@@ -195,7 +218,8 @@ def mock_async_mongodb_db(mocker):
                     "Bad": {"avg": 0.75, "min": 0.7, "max": 0.8, "sum": 1.5}
                 },
                 "elapsedTime": {"avg": 0.05, "min": 0.01, "max": 0.12, "sum": 0.5}
-            }
+            },
+            "samples": {}
         },
         {
             "_id": "507f1f77bcf86cd799439022",
@@ -206,17 +230,102 @@ def mock_async_mongodb_db(mocker):
             "date": datetime(2026, 2, 1),
             "location": "Line 2",
             "equipmentId": "EQ-02",
-            "task": "classification"
+            "task": "cls"
         }
     ])
 
     summaries = mocker.MagicMock(name="InspectionsSummaryCollectionMocker")
     summaries.find = mocker.MagicMock(return_value=summaries_cursor)
 
+    dataset_families_cursor = mocker.MagicMock(name="DatasetFamiliesCursor")
+    dataset_families_cursor.sort = mocker.MagicMock(return_value=dataset_families_cursor)
+    dataset_families_cursor.to_list = mocker.AsyncMock(return_value=[
+        {
+            "_id": "69fd14e65b804eb1b8b60be4",
+            "datasetFamilyName": "hqehleddisplay",
+            "task": "det",
+            "members": [
+                {"datasetId": "69fd14e65b804eb1b8b60be5", "version": "1.0", "description": "SEC_AC_EH_LED Display"},
+                {"datasetId": "6a03d7085b804eb1b8b6b297", "version": "1.1", "description": ""}
+            ],
+            "accessControl": {"groups": ["52", "65"], "users": []},
+            "createdAt": datetime(2026, 5, 7)
+        },
+        {
+            "_id": "69fd14e65b804eb1b8b60be6",
+            "datasetFamilyName": "epoxyinspection",
+            "task": "cls",
+            "createdAt": datetime(2026, 6, 1)
+        }
+    ])
+
+    dataset_documents_cursor = mocker.MagicMock(name="DatasetDocumentsCursor")
+    dataset_documents_cursor.sort = mocker.MagicMock(return_value=dataset_documents_cursor)
+    dataset_documents_cursor.to_list = mocker.AsyncMock(return_value=[
+        {
+            "_id": "69fd14e65b804eb1b8b60be5",
+            "name": "hqehleddisplay",
+            "version": "1.0",
+            "task": "det",
+            "description": "SEC_AC_EH_LED Display",
+            "createdBy": "minchang.kim",
+            "projects": ["hqehleddisplay/detarea"],
+            "accessControl": {"groups": ["52", "65"], "users": []},
+            "familyId": "69fd14e65b804eb1b8b60be4",
+            "schemaVersion": "1.0",
+            "createdAt": datetime(2026, 5, 7),
+            "modifiedAt": datetime(2026, 5, 7),
+            "isFinalized": True,
+            "finalizedAt": datetime(2026, 5, 7),
+            "isUsed": True,
+            "downloadCount": 1,
+            "downloadUri": "datasets/69fd14e65b804eb1b8b60be5/hqehleddisplay_1.0_20260507-224142Z.zip",
+            "dataCount": 198,
+            "classes": {
+                "STEP 0": {"count": 48, "color": "#ff0000", "shape": "rectangle"},
+                "STEP 1": {"count": 50, "color": "#ff0000", "shape": "rectangle"}
+            },
+            "trainingRecords": [
+                {
+                    "aiModel": "EpoxyModel",
+                    "version": "v1",
+                    "startTime": datetime(2026, 5, 8),
+                    "endTime": datetime(2026, 5, 9),
+                    "status": "completed",
+                    "trainingInfo": "epochs=10"
+                }
+            ]
+        },
+        {
+            "_id": "6a03d7085b804eb1b8b6b297",
+            "name": "hqehleddisplay",
+            "version": "1.1",
+            "task": "det",
+            "createdBy": "minchang.kim",
+            "familyId": "69fd14e65b804eb1b8b60be4",
+            "schemaVersion": "1.0",
+            "createdAt": datetime(2026, 5, 10),
+            "modifiedAt": datetime(2026, 5, 10)
+        }
+    ])
+
+    datasets = mocker.MagicMock(name="DatasetsCollectionMocker")
+    datasets.find = mocker.MagicMock(
+        side_effect=lambda query, projection=None:
+            dataset_families_cursor if "datasetFamilyName" in query else dataset_documents_cursor
+    )
+
+    inspections = mocker.MagicMock(name="InspectionsCollectionMocker")
+    inspections.count_documents = mocker.AsyncMock(return_value=len(DRIFT_ROWS))
+    inspections.aggregate = mocker.MagicMock(side_effect=lambda pipeline, **kwargs: AsyncRowCursor(DRIFT_ROWS))
+
     collections_by_name = {
         DBCollections.DAILY_MODELS: daily_models,
-        DBCollections.INSPECTIONS_SUMMARY: summaries
+        DBCollections.INSPECTIONS_SUMMARY: summaries,
+        DBCollections.DATASETS: datasets,
+        DBCollections.INSPECTIONS: inspections
     }
+
     db.__getitem__.side_effect = lambda name: collections_by_name.get(name, collection_a)
 
     return db

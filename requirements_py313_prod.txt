@@ -7,3 +7,4 @@ pymongo==4.17.0
 PyYAML==6.0.3
 typing_extensions==4.15.0
 uvicorn==0.46.0
+tzdata==2026.4

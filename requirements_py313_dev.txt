@@ -14,3 +14,4 @@ PyYAML==6.0.3
 Twisted==25.5.0
 typing_extensions==4.15.0
 uvicorn==0.46.0
+tzdata==2026.4

@@ -2,8 +2,9 @@ import pytest
 from datetime import datetime
 from pymongo.errors import AutoReconnect
 
-from common.constants import LIMIT, EXCLUDE_SAMPLES, DBCollections
+from common.constants import DBCollections
 from mongodb_mcp.connector import MongoDBConnector
+from mongodb_mcp.utils import generate_normalized_regex
 
 
 class TestMongoDBConnector:
@@ -92,8 +93,8 @@ class TestMongoDBConnector:
     @pytest.mark.asyncio
     async def test_get_collection_stats(self, mock_connector):
         result = await mock_connector.get_collection_stats("collection_a")
-        assert result["db"] == "testDb"
-        assert result["collections"] == 10
+        assert result.ns == "testDb"
+        assert result.size == 111
 
         mock_connector._mock_db.command.assert_awaited()
 
@@ -408,99 +409,180 @@ class TestMongoDBConnector:
             await mock_connector.find_inspection_models()
 
     @pytest.mark.asyncio
-    async def test_find_inspection_summaries(self, mocker, mock_connector):
+    async def test_find_inspection_summary_documents(self, mocker, mock_connector):
         mock_connector._mock_db.list_collection_names = mocker.AsyncMock(
             return_value=["collection_a", DBCollections.INSPECTIONS_SUMMARY]
         )
 
-        result = await mock_connector.find_inspection_summaries(
+        result = await mock_connector.find_inspection_summary_documents(
             model_name="EpoxyModel",
             gbm="SEV",
             location="Line 1",
             equipment_id="EQ-01",
-            product_id="PR-01",
-            conclusion="Good"
+            product_id="PR-01"
         )
         assert len(result.summaries) == 2
 
         summary = result.summaries[0]
         assert summary.model_name == "EpoxyModel"
         assert summary.equipment_id == "EQ-01"
-        assert summary.inspection_ids == ["insp_1", "insp_2"]
         assert summary.threshold == 0.7
-        assert summary.statistics.data_count == {"Good": 8, "Bad": 2}
-        assert summary.statistics.confidence["Good"].avg == 0.9
-        assert summary.statistics.elapsed_time.max == 0.12
 
-        collection = mock_connector._mock_db[DBCollections.INSPECTIONS_SUMMARY]
-        collection.find.assert_called_once()
-
-        query, kwargs = collection.find.call_args[0][0], collection.find.call_args[1]
-        assert query["gbm"] == "SEV"
-        assert query["equipmentId"] == "EQ-01"
-        assert query["productId"] == "PR-01"
-        assert query["conclusion"] == "Good"
-        assert "$regex" in query["location"]
-        assert "$regex" in query["modelName"]
-        assert kwargs["projection"] == EXCLUDE_SAMPLES
-
-        collection.find.return_value.to_list.assert_awaited_with(length=LIMIT)
-
-    @pytest.mark.asyncio
-    async def test_find_inspection_summaries_date_range(self, mocker, mock_connector):
-        mock_connector._mock_db.list_collection_names = mocker.AsyncMock(
-            return_value=["collection_a", DBCollections.INSPECTIONS_SUMMARY]
-        )
         collection = mock_connector._mock_db[DBCollections.INSPECTIONS_SUMMARY]
 
         start_date, end_date = datetime(2026, 1, 1), datetime(2026, 2, 1)
-        await mock_connector.find_inspection_summaries(start_date=start_date, end_date=end_date, limit=2)
+        await mock_connector.find_inspection_summary_documents(start_date=start_date, end_date=end_date, limit=2)
 
         query = collection.find.call_args[0][0]
         assert query == {"date": {"$gte": start_date, "$lte": end_date}}
         collection.find.return_value.to_list.assert_awaited_with(length=2)
 
-        await mock_connector.find_inspection_summaries()
+        await mock_connector.find_inspection_summary_documents()
         assert collection.find.call_args[0][0] == {}
 
     @pytest.mark.asyncio
-    async def test_find_inspection_summaries_optional_fields(self, mocker, mock_connector):
+    async def test_find_dataset_family_documents(self, mocker, mock_connector):
         mock_connector._mock_db.list_collection_names = mocker.AsyncMock(
-            return_value=["collection_a", DBCollections.INSPECTIONS_SUMMARY]
+            return_value=["collection_a", DBCollections.DATASETS]
         )
 
-        result = await mock_connector.find_inspection_summaries()
-        summary = result.summaries[1]
+        result = await mock_connector.find_dataset_family_documents(dataset_family_name="hqehleddisplay", task="det")
+        assert len(result.families) == 2
 
-        assert summary.schema_version == "1.0"
-        assert summary.mode is None
-        assert summary.product_id is None
-        assert summary.local_timezone is None
-        assert summary.conclusion is None
-        assert summary.threshold is None
-        assert summary.inspection_ids == []
-        assert summary.classes == []
-        assert summary.statistics.data_count == {}
-        assert summary.statistics.elapsed_time.avg == 0.0
+        family = result.families[0]
+        assert family.family_id == "69fd14e65b804eb1b8b60be4"
+        assert family.dataset_family_name == "hqehleddisplay"
+        assert family.task == "det"
+        assert len(family.members) == 2
+        assert family.members[0].dataset_id == "69fd14e65b804eb1b8b60be5"
+        assert family.members[0].version == "1.0"
+        assert family.access_control.groups == ["52", "65"]
+        assert result.families[1].members == []
+
+        collection = mock_connector._mock_db[DBCollections.DATASETS]
+        collection.find.assert_called_once()
+
+        query = collection.find.call_args[0][0]
+        assert query["datasetFamilyName"] == generate_normalized_regex("hqehleddisplay")
+        assert query["task"] == "det"
+
+        start_date, end_date = datetime(2026, 1, 1), datetime(2026, 2, 1)
+        await mock_connector.find_dataset_family_documents(start_date=start_date, end_date=end_date, limit=2)
+
+        query = collection.find.call_args[0][0]
+        assert query == {
+            "datasetFamilyName": {"$exists": True},
+            "createdAt": {"$gte": start_date, "$lte": end_date}
+        }
+        collection.find({"datasetFamilyName": {"$exists": True}}).to_list.assert_awaited_with(length=2)
+
+        await mock_connector.find_dataset_family_documents()
+        assert collection.find.call_args[0][0] == {"datasetFamilyName": {"$exists": True}}
+
+        cursor = collection.find({"datasetFamilyName": {"$exists": True}})
+        await mock_connector.find_dataset_family_documents(sort_field="createdAt")
+        cursor.sort.assert_called_once_with("createdAt", mocker.ANY)
+
+        mock_connector._mock_db.list_collection_names = mocker.AsyncMock(return_value=["collection_a"])
+        with pytest.raises(ValueError):
+            await mock_connector.find_dataset_family_documents()
+
+        mock_connector._mock_db.list_collection_names = mocker.AsyncMock(
+            return_value=["collection_a", DBCollections.DATASETS]
+        )
+        cursor.to_list.side_effect = RuntimeError("Connector error")
+        with pytest.raises(RuntimeError, match="Connector error"):
+            await mock_connector.find_dataset_family_documents()
+
+    def test_exclude_fields(self, mock_connector):
+        excluded = ("dataMap", "lastJob")
+
+        assert mock_connector._exclude_fields(None, excluded) == {"dataMap": 0, "lastJob": 0}
+        assert mock_connector._exclude_fields({}, excluded) == {"dataMap": 0, "lastJob": 0}
+        assert mock_connector._exclude_fields({"classes": 0}, excluded) == {"classes": 0, "dataMap": 0, "lastJob": 0}
+        assert mock_connector._exclude_fields({"dataMap": 1, "name": 1}, excluded) == {"name": 1}
+        assert mock_connector._exclude_fields({"_id": 0, "name": 1, "lastJob": 1}, excluded) == {"_id": 0, "name": 1}
+        assert mock_connector._exclude_fields({"dataMap": 1}, excluded) == {"dataMap": 0, "lastJob": 0}
 
     @pytest.mark.asyncio
-    async def test_find_inspection_summaries_errors(self, mocker, mock_connector):
+    async def test_find_dataset_documents(self, mocker, mock_connector):
+        mock_connector._mock_db.list_collection_names = mocker.AsyncMock(
+            return_value=["collection_a", DBCollections.DATASETS]
+        )
+
+        result = await mock_connector.find_dataset_documents(
+            name="hqehleddisplay",
+            version="1.0",
+            task="det",
+            created_by="minchang.kim",
+            is_finalized=True,
+            is_used=True
+        )
+        assert len(result.datasets) == 2
+
+        dataset = result.datasets[0]
+        assert dataset.document_id == "69fd14e65b804eb1b8b60be5"
+        assert dataset.name == "hqehleddisplay"
+        assert dataset.version == "1.0"
+        assert dataset.family_id == "69fd14e65b804eb1b8b60be4"
+        assert dataset.is_finalized is True
+        assert dataset.data_count == 198
+        assert dataset.classes["STEP 1"].count == 50
+        assert dataset.classes["STEP 1"].shape == "rectangle"
+        assert dataset.training_records[0].ai_model == "EpoxyModel"
+        assert dataset.training_records[0].status == "completed"
+        assert not hasattr(dataset, "data_map")
+        assert not hasattr(dataset, "last_job")
+        assert result.datasets[1].classes == {}
+
+        collection = mock_connector._mock_db[DBCollections.DATASETS]
+        collection.find.assert_called_once()
+
+        query = collection.find.call_args[0][0]
+        assert query["schemaVersion"] == {"$exists": True}
+        assert query["name"] == generate_normalized_regex("hqehleddisplay")
+        assert query["version"] == generate_normalized_regex("1.0")
+        assert query["task"] == "det"
+        assert query["createdBy"] == generate_normalized_regex("minchang.kim")
+        assert query["isFinalized"] is True
+        assert query["isUsed"] is True
+        assert collection.find.call_args[1]["projection"] == {"dataMap": 0, "lastJob": 0}
+
+        start_date, end_date = datetime(2026, 1, 1), datetime(2026, 2, 1)
+        await mock_connector.find_dataset_documents(
+            start_date=start_date,
+            end_date=end_date,
+            projection={"classes": 0},
+            limit=2
+        )
+
+        query = collection.find.call_args[0][0]
+        assert query == {
+            "schemaVersion": {"$exists": True},
+            "createdAt": {"$gte": start_date, "$lte": end_date}
+        }
+        assert collection.find.call_args[1]["projection"] == {"classes": 0, "dataMap": 0, "lastJob": 0}
+
+        cursor = collection.find({"schemaVersion": {"$exists": True}})
+        cursor.to_list.assert_awaited_with(length=2)
+
+        await mock_connector.find_dataset_documents(is_used=False, projection={"name": 1, "dataMap": 1})
+        assert collection.find.call_args[0][0] == {"schemaVersion": {"$exists": True}, "isUsed": False}
+        assert collection.find.call_args[1]["projection"] == {"name": 1}
+
+        await mock_connector.find_dataset_documents(sort_field="createdAt")
+        cursor.sort.assert_called_once_with("createdAt", mocker.ANY)
+
         mock_connector._mock_db.list_collection_names = mocker.AsyncMock(return_value=["collection_a"])
-        with pytest.raises(ValueError, match=f"Collection {DBCollections.INSPECTIONS_SUMMARY} doesn't exist"):
-            await mock_connector.find_inspection_summaries()
+        with pytest.raises(ValueError):
+            await mock_connector.find_dataset_documents()
 
         mock_connector._mock_db.list_collection_names = mocker.AsyncMock(
-            return_value=["collection_a", DBCollections.INSPECTIONS_SUMMARY]
+            return_value=["collection_a", DBCollections.DATASETS]
         )
-        collection = mock_connector._mock_db[DBCollections.INSPECTIONS_SUMMARY]
-
-        await mock_connector.find_inspection_summaries(sort_field="date", projection={"statistics": 0})
-        collection.find.return_value.sort.assert_called_once_with("date", mocker.ANY)
-        assert collection.find.call_args[1]["projection"] == {"statistics": 0}
-
-        collection.find.return_value.to_list.side_effect = RuntimeError("Connector error")
+        cursor.to_list.side_effect = RuntimeError("Connector error")
         with pytest.raises(RuntimeError, match="Connector error"):
-            await mock_connector.find_inspection_summaries()
+            await mock_connector.find_dataset_documents()
 
     @pytest.mark.asyncio
     async def test_close(self, mock_connector):

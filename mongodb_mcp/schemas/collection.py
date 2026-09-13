@@ -1,32 +1,31 @@
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
+from pydantic.alias_generators import to_camel
 
 
 class ListCollectionsResult(BaseModel):
     collections: list[str] = []
 
 
-class GetCollectionInfoResult(BaseModel):
-    collection_name: str
-    collection_id: int
-    auto_id: bool
-    description: str
-    num_shards: int
-    num_partitions: int = 0
-    enable_namespace: bool
-    enable_dynamic_field: bool
-    aliases: list[Any] = []
-    classes: dict[str, int] = {}
-    fields: list[dict[Any, Any]] = []
-    functions: list[Any] = []
-    consistency_level: int = 0
-    properties: dict[str, Any] = {}
-
-
 class GetCollectionStatsResult(BaseModel):
-    collection_name: str
-    row_count: int
+    model_config = ConfigDict(populate_by_name=True, alias_generator=to_camel)
+
+    ns: str
+    size: int
+    count: int
+    storage_size: int
+    free_storage_size: int
+    avg_obj_size: int
+    num_orphan_docs: int = 0
+    capped: bool
+    wired_tiger: dict[str, Any] = {}
+    index_builds: list[Any] = []
+    total_index_size: int = 0
+    index_sizes: dict[str, Any] = {}
+    total_size: int = 0
+    scale_factor: int = 0
+    ok: int = 1
 
 
 class CreateCollectionResult(BaseModel):
@@ -43,12 +42,6 @@ class RenameCollectionResult(BaseModel):
     collection_name: str
     new_collection_name: str
     collection_renamed: bool = True
-
-
-class LoadCollectionResult(BaseModel):
-    collection_name: str
-    collection_loaded: bool = True
-    replica_number: int = 1
 
 
 class IndexInfo(BaseModel):

@@ -1,13 +1,14 @@
-from datetime import datetime
-
 import pytest
 import pytest_asyncio
+from datetime import datetime
 from fastmcp.exceptions import ToolError
 
 from mongodb_mcp.tools import tools_mcp
 from mongodb_mcp.schemas import (
-    GetIndicesResult, PingDatabaseResult, FindInspectionModelsResult, InspectionModelInfo,
-    FindInspectionSummariesResult, InspectionSummaryInfo, InspectionStatistics
+    GetIndicesResult, PingDatabaseResult, FindInspectionModelsResult, Statistics,
+    InspectionModelInfo, FindInspectionSummaryDocumentsResult, InspectionSummaryDocument,
+    FindDatasetFamilyDocumentsResult, DatasetFamilyDocument, FamilyMember,
+    FindDatasetDocumentsResult, DatasetDocument, LabelAttributes
 )
 
 
@@ -92,8 +93,8 @@ class TestMongoDBMCPTools:
         tool = tools_by_name["mongodb_get_collection_stats"]
         result = await tool(mock_context, "collection_a")
 
-        assert result["db"] == "testDb"
-        assert result["collections"] == 10
+        assert result.ns == "testDb"
+        assert result.size == 111
 
         mock_context.request_context.lifespan_context.connector.get_collection_stats = \
             mocker.AsyncMock(side_effect=RuntimeError())
@@ -344,11 +345,11 @@ class TestMongoDBMCPTools:
             await tool(mock_context, model_name="EpoxyInspector")
 
     @pytest.mark.asyncio
-    async def test_mongodb_find_inspection_summaries(self, mocker, tools_by_name, mock_context):
-        tool = tools_by_name["mongodb_find_inspection_summaries"]
-        mock_context.request_context.lifespan_context.connector.find_inspection_summaries = \
-            mocker.AsyncMock(return_value=FindInspectionSummariesResult(summaries=[
-                InspectionSummaryInfo(
+    async def test_mongodb_find_inspection_summary_documents(self, mocker, tools_by_name, mock_context):
+        tool = tools_by_name["mongodb_find_inspection_summary_documents"]
+        mock_context.request_context.lifespan_context.connector.find_inspection_summary_documents = \
+            mocker.AsyncMock(return_value=FindInspectionSummaryDocumentsResult(summaries=[
+                InspectionSummaryDocument(
                     model_name="EpoxyInspector",
                     model_version="v1",
                     gbm="SEV",
@@ -356,8 +357,8 @@ class TestMongoDBMCPTools:
                     date=datetime(2026, 1, 1),
                     location="Line 1",
                     equipment_id="EQ-01",
-                    task="classification",
-                    statistics=InspectionStatistics(data_count={"Good": 8})
+                    task="cls",
+                    statistics=Statistics(data_count={"Good": 8})
                 )
             ]))
 
@@ -368,10 +369,71 @@ class TestMongoDBMCPTools:
         assert result.summaries[0].statistics.data_count == {"Good": 8}
 
         connector = mock_context.request_context.lifespan_context.connector
-        connector.find_inspection_summaries.assert_awaited_once()
-        assert connector.find_inspection_summaries.await_args.kwargs["equipment_id"] == "EQ-01"
+        connector.find_inspection_summary_documents.assert_awaited_once()
+        assert connector.find_inspection_summary_documents.await_args.kwargs["equipment_id"] == "EQ-01"
 
-        mock_context.request_context.lifespan_context.connector.find_inspection_summaries = \
+        mock_context.request_context.lifespan_context.connector.find_inspection_summary_documents = \
             mocker.AsyncMock(side_effect=RuntimeError())
         with pytest.raises(ToolError):
             await tool(mock_context, model_name="EpoxyInspector")
+
+    @pytest.mark.asyncio
+    async def test_mongodb_find_dataset_families_documents(self, mocker, tools_by_name, mock_context):
+        tool = tools_by_name["mongodb_find_dataset_families_documents"]
+        mock_context.request_context.lifespan_context.connector.find_dataset_family_documents =             mocker.AsyncMock(return_value=FindDatasetFamilyDocumentsResult(families=[
+                DatasetFamilyDocument(
+                    family_id="69fd14e65b804eb1b8b60be4",
+                    dataset_family_name="hqehleddisplay",
+                    task="det",
+                    members=[FamilyMember(dataset_id="69fd14e65b804eb1b8b60be5", version="1.0")],
+                    created_at=datetime(2026, 5, 7)
+                )
+            ]))
+
+        result = await tool(mock_context, dataset_family_name="hqehleddisplay", task="det")
+        assert len(result.families) == 1
+        assert result.families[0].dataset_family_name == "hqehleddisplay"
+        assert result.families[0].members[0].dataset_id == "69fd14e65b804eb1b8b60be5"
+
+        connector = mock_context.request_context.lifespan_context.connector
+        connector.find_dataset_family_documents.assert_awaited_once()
+        assert connector.find_dataset_family_documents.await_args.kwargs["task"] == "det"
+
+        mock_context.request_context.lifespan_context.connector.find_dataset_family_documents =             mocker.AsyncMock(side_effect=RuntimeError())
+        with pytest.raises(ToolError):
+            await tool(mock_context, dataset_family_name="hqehleddisplay")
+
+    @pytest.mark.asyncio
+    async def test_mongodb_find_dataset_documents(self, mocker, tools_by_name, mock_context):
+        tool = tools_by_name["mongodb_find_dataset_documents"]
+        mock_context.request_context.lifespan_context.connector.find_dataset_documents = \
+            mocker.AsyncMock(return_value=FindDatasetDocumentsResult(datasets=[
+                DatasetDocument(
+                    document_id="69fd14e65b804eb1b8b60be5",
+                    name="hqehleddisplay",
+                    version="1.0",
+                    task="det",
+                    created_by="minchang.kim",
+                    family_id="69fd14e65b804eb1b8b60be4",
+                    created_at=datetime(2026, 5, 7),
+                    modified_at=datetime(2026, 5, 7),
+                    is_used=True,
+                    data_count=198,
+                    classes={"STEP 1": LabelAttributes(count=50, shape="rectangle")}
+                )
+            ]))
+
+        result = await tool(mock_context, name="hqehleddisplay", is_used=True)
+        assert len(result.datasets) == 1
+        assert result.datasets[0].name == "hqehleddisplay"
+        assert result.datasets[0].data_count == 198
+        assert result.datasets[0].classes["STEP 1"].count == 50
+
+        connector = mock_context.request_context.lifespan_context.connector
+        connector.find_dataset_documents.assert_awaited_once()
+        assert connector.find_dataset_documents.await_args.kwargs["is_used"] is True
+
+        mock_context.request_context.lifespan_context.connector.find_dataset_documents = \
+            mocker.AsyncMock(side_effect=RuntimeError())
+        with pytest.raises(ToolError):
+            await tool(mock_context, name="hqehleddisplay")

@@ -118,7 +118,7 @@ async def mongodb_rename_collection(
 
 
 @tools_mcp.tool()
-async def mongodb_get_collection_stats(ctx: Context, collection_name: str) -> dict[str, Any]:
+async def mongodb_get_collection_stats(ctx: Context, collection_name: str) -> GetCollectionStatsResult:
     """Get statistics information for a collection
 
     Args:
@@ -146,7 +146,7 @@ async def mongodb_get_collection_stats(ctx: Context, collection_name: str) -> di
 
 @tools_mcp.tool()
 async def mongodb_get_database_stats(ctx: Context) -> GetDatabaseStats:
-    """Get statistics information for a database
+    """Get database statistics information
 
     Returns:
         Database statistics with the following fields:
@@ -533,7 +533,7 @@ async def mongodb_find_inspection_models(
         sort_field: str | None = None,
         sort_order: int = ASCENDING
 ) -> FindInspectionModelsResult:
-    """Find inspection models with optional filters
+    """Find inspection models information with optional filters
 
     All filter arguments are optional. Omit any you don't want to filter on.
 
@@ -584,7 +584,7 @@ async def mongodb_find_inspection_models(
 
 
 @tools_mcp.tool()
-async def mongodb_find_inspection_summaries(
+async def mongodb_find_inspection_summary_documents(
         ctx: Context,
         model_name: str | None = None,
         model_version: str | None = None,
@@ -595,15 +595,14 @@ async def mongodb_find_inspection_summaries(
         location: str | None = None,
         equipment_id: str | None = None,
         product_id: str | None = None,
-        conclusion: str | None = None,
         start_date: datetime | None = None,
         end_date: datetime | None = None,
         projection: dict[str, Any] | None = None,
         limit: int = LIMIT,
         sort_field: str | None = None,
         sort_order: int = ASCENDING
-) -> FindInspectionSummariesResult:
-    """Find inspection summaries with optional filters
+) -> FindInspectionSummaryDocumentsResult:
+    """Find inspection results summaries with optional filters
 
     All filter arguments are optional. Omit any you don't want to filter on. The per data sample details of an
     inspection are left out of the results, only the statistics aggregated over them are returned.
@@ -618,7 +617,6 @@ async def mongodb_find_inspection_summaries(
         location: Location within the process line where the inspection ran
         equipment_id: Id of the equipment the inspection ran on
         product_id: Id of the inspected product
-        conclusion: Conclusion the inspection arrived at
         start_date: Lower range for inspection date
         end_date: Upper range for inspection date
         projection: Projection (fields to include/exclude), samples are excluded when omitted
@@ -630,9 +628,8 @@ async def mongodb_find_inspection_summaries(
         Inspection summary list with the following fields:
             summaries: Matching inspection summaries, empty when the filters matched nothing, each with the
               following fields:
-                schemaVersion: Version of the inspection summary schema
-                modelName: Name of the inspection model the summary was produced by
-                modelVersion: Version of the inspection model the summary was produced by
+                modelName: Name of the inspection model
+                modelVersion: Version of the inspection model
                 gbm: Manufacturing site where the inspection ran
                 process: Process line where the inspection ran
                 mode: Operating mode the inspection ran in
@@ -641,12 +638,10 @@ async def mongodb_find_inspection_summaries(
                 equipmentId: Id of the equipment the inspection ran on
                 productId: Id of the inspected product
                 localTimezone: Timezone of the site the inspection ran on
-                inspectionIds: Ids of the inspections the summary aggregates
                 task: Task the inspection model performs
                 classes: Prediction classes the inspection model can output
-                conclusion: Conclusion the inspection arrived at
                 threshold: Confidence threshold the inspection decided with
-                statistics: Statistics aggregated over the inspected data samples, with the following fields:
+                statistics: Statistics aggregated over the inspection results, with the following fields:
                     dataCount: Number of inspected data samples per prediction class
                     confidence: Confidence statistics per prediction class, each with the following fields:
                         avg: Average confidence of the class
@@ -654,10 +649,11 @@ async def mongodb_find_inspection_summaries(
                         max: Highest confidence of the class
                         sum: Total confidence of the class
                     elapsedTime: Inference time statistics in seconds, with the same fields as confidence
+                samples: Sample inspection result for each prediction class.
     """
     try:
         connector = ctx.request_context.lifespan_context.connector
-        return await connector.find_inspection_summaries(
+        return await connector.find_inspection_summary_documents(
             model_name=model_name,
             model_version=model_version,
             gbm=gbm,
@@ -667,7 +663,6 @@ async def mongodb_find_inspection_summaries(
             location=location,
             equipment_id=equipment_id,
             product_id=product_id,
-            conclusion=conclusion,
             start_date=start_date,
             end_date=end_date,
             projection=projection,
@@ -677,3 +672,280 @@ async def mongodb_find_inspection_summaries(
         )
     except Exception as e:
         raise ToolError(f"Failed to find inspection summaries: {str(e)}")
+
+
+@tools_mcp.tool()
+async def mongodb_find_dataset_families_documents(
+        ctx: Context,
+        dataset_family_name: str | None = None,
+        task: str | None = None,
+        start_date: datetime | None = None,
+        end_date: datetime | None = None,
+        projection: dict[str, Any] | None = None,
+        limit: int = LIMIT,
+        sort_field: str | None = None,
+        sort_order: int = ASCENDING
+) -> FindDatasetFamilyDocumentsResult:
+    """Find dataset families with optional filters
+
+    All filter arguments are optional. Omit any you don't want to filter on. A dataset family groups every version
+    of a dataset, each version is listed as a member together with the id of its dataset document.
+
+    Args:
+        dataset_family_name: Name of the dataset family
+        task: Task the datasets of the family are made for
+        start_date: Lower range for the family creation date
+        end_date: Upper range for the family creation date
+        projection: Projection (fields to include/exclude)
+        limit: Maximum number of documents to return (5 is default)
+        sort_field: Field name to sort results based on
+        sort_order: Result sorting order
+
+    Returns:
+        Dataset family list with the following fields:
+            families: Matching dataset families, empty when the filters matched nothing, each with the
+              following fields:
+                familyId: Id of the dataset family
+                datasetFamilyName: Name of the dataset family
+                task: Task the datasets of the family are made for
+                members: Dataset versions belonging to the family, each with the following fields:
+                    datasetId: Id of the dataset document of the version
+                    version: Version of the dataset
+                    description: Description of the dataset version
+                accessControl: Who can access the family, with the following fields:
+                    groups: Ids of the groups allowed to access the family
+                    users: Ids of the users allowed to access the family
+                createdAt: Date the family was created on
+    """
+    try:
+        connector = ctx.request_context.lifespan_context.connector
+        return await connector.find_dataset_family_documents(
+            dataset_family_name=dataset_family_name,
+            task=task,
+            start_date=start_date,
+            end_date=end_date,
+            projection=projection,
+            limit=limit,
+            sort_field=sort_field,
+            sort_order=sort_order
+        )
+    except Exception as e:
+        raise ToolError(f"Failed to find dataset families: {str(e)}")
+
+
+@tools_mcp.tool()
+async def mongodb_find_dataset_documents(
+        ctx: Context,
+        name: str | None = None,
+        version: str | None = None,
+        task: str | None = None,
+        created_by: str | None = None,
+        is_finalized: bool | None = None,
+        is_used: bool | None = None,
+        start_date: datetime | None = None,
+        end_date: datetime | None = None,
+        projection: dict[str, Any] | None = None,
+        limit: int = LIMIT,
+        sort_field: str | None = None,
+        sort_order: int = ASCENDING
+) -> FindDatasetDocumentsResult:
+    """Find dataset documents with optional filters
+
+    All filter arguments are optional. Omit any you don't want to filter on. The per data sample map of a dataset
+    and its last job are always left out of the results, only the summary fields are returned. Each dataset
+    document is one version of a dataset family.
+
+    Args:
+        name: Name of the dataset
+        version: Version of the dataset
+        task: Task the dataset is made for
+        created_by: User who created the dataset
+        is_finalized: Whether the dataset is finalized
+        is_used: Whether the dataset has been used
+        start_date: Lower range for the dataset creation date
+        end_date: Upper range for the dataset creation date
+        projection: Projection (fields to include/exclude), dataMap and lastJob are always excluded
+        limit: Maximum number of documents to return (5 is default)
+        sort_field: Field name to sort results based on
+        sort_order: Result sorting order
+
+    Returns:
+        Dataset list with the following fields:
+            datasets: Matching datasets, empty when the filters matched nothing, each with the following fields:
+                documentId: Id of the dataset document
+                name: Name of the dataset
+                version: Version of the dataset
+                task: Task the dataset is made for
+                description: Description of the dataset
+                createdBy: User who created the dataset
+                projects: Projects the dataset is used in
+                accessControl: Who can access the dataset, with the following fields:
+                    groups: Ids of the groups allowed to access the dataset
+                    users: Ids of the users allowed to access the dataset
+                familyId: Id of the dataset family the dataset belongs to
+                schemaVersion: Version of the dataset document schema
+                createdAt: Date the dataset was created on
+                modifiedAt: Date the dataset was last modified on
+                isFinalized: Whether the dataset is finalized
+                finalizedAt: Date the dataset was finalized on
+                isUsed: Whether the dataset has been used
+                downloadCount: Number of times the dataset was downloaded
+                downloadUri: Uri of the downloadable dataset archive
+                dataCount: Number of data samples in the dataset
+                classes: Label classes of the dataset keyed by class name, each with the following fields:
+                    count: Number of labels of the class
+                    color: Display color of the class
+                    shape: Label shape of the class
+                trainingRecords: Trainings the dataset was used in, each with the following fields:
+                    aiModel: Name of the trained model
+                    version: Version of the trained model
+                    startTime: Time the training started at
+                    endTime: Time the training ended at
+                    status: Final status of the training
+                    trainingInfo: Additional training information
+    """
+    try:
+        connector = ctx.request_context.lifespan_context.connector
+        return await connector.find_dataset_documents(
+            name=name,
+            version=version,
+            task=task,
+            created_by=created_by,
+            is_finalized=is_finalized,
+            is_used=is_used,
+            start_date=start_date,
+            end_date=end_date,
+            projection=projection,
+            limit=limit,
+            sort_field=sort_field,
+            sort_order=sort_order
+        )
+    except Exception as e:
+        raise ToolError(f"Failed to find datasets: {str(e)}")
+
+
+@tools_mcp.tool()
+async def mongodb_analyze_data_drift(
+        ctx: Context,
+        model_name: str,
+        model_version: str,
+        start_date: datetime,
+        end_date: datetime,
+        task: str | None = None,
+        gbm: str | None = None,
+        process: str | None = None,
+        location: str | None = None,
+        equipment_id: str | None = None,
+        mode: str | None = "production",
+        bucket: str = "auto",
+        detail: str = "full",
+        defect_classes: list[str] | None = None,
+        reference_start: datetime | None = None,
+        reference_end: datetime | None = None
+) -> DriftAnalysisResult:
+    """Compute the statistics needed to decide whether an inspection model's input data or behaviour drifted
+
+    Works on the raw inspection results of one classification (cls) or object detection (det) model. Segmentation
+    models are not supported. Two modes exist:
+      - Range mode (default): analyses start_date to end_date, splits it into time buckets, searches for the moment
+        the output distribution changed the most (change point), for gradual trends, and for outlier buckets.
+      - Comparison mode: when reference_start and reference_end are also given, the reference window is compared
+        against the current window at a fixed split instead of searching for one.
+    The windows together may cover at most 30 days. Statistics are computed over every prediction of the model, a
+    document contributes one record per matching aiResults entry and prediction. For detection models the
+    confidence and class statistics are computed over bounding boxes, a list of confidences is reduced to its
+    maximum. Nothing here is a verdict; the flags and pre-verdict are deterministic rules to be confirmed or
+    overruled by reading the statistics.
+
+    Args:
+        model_name: Name of the inspection model, matched exactly together with the version as name/version
+        model_version: Version of the inspection model
+        start_date: Start of the analysed (current) window, inclusive
+        end_date: End of the analysed (current) window, exclusive
+        task: Task of the model, cls or det, required only when the model string is used for both tasks
+        gbm: Manufacturing site the inspections ran at, exact match
+        process: Process the inspections ran in, exact match
+        location: Location within the process, exact match
+        equipment_id: Id of the equipment the inspections ran on, exact match
+        mode: Operating mode of the inspections, production by default, pass null to include every mode
+        bucket: Time bucket size, auto (default), 1h, shift, 1d or 1w; auto picks by range length and volume
+        detail: full (default) keeps every histogram and quantile per bucket, compact keeps only the scalar series
+        defect_classes: Classes counted in the defect rate, every class except Good by default
+        reference_start: Start of the reference window for comparison mode, inclusive
+        reference_end: End of the reference window for comparison mode, exclusive, must precede start_date
+
+    Returns:
+        Drift analysis with the following fields:
+            modelName, modelVersion, task: The analysed model
+            mode: range or comparison
+            filters: The metadata filters that were applied
+            range, referenceRange: Analysed windows with start, end and length in days
+            bucket: The resolved bucket size
+            status: What could be computed, with the following fields:
+                analysisPossible: Whether a change point or comparison was computed
+                changePointRan, comparisonRan, trendRan, outlierRan: Which analyses ran
+                nBuckets: Number of buckets after merging small ones
+            dataQuality: Volume and problems of the scanned data, with the following fields:
+                nDocsScanned: Documents matching the filters
+                nDocsMatched, nEntriesMatched: Documents and aiResults entries that produced records
+                nRecords: Predictions analysed (images for detection)
+                nBoxes: Bounding boxes analysed, detection only
+                nMissingConfidence, nMissingImageSpec, nParseErrors, parseErrorExamples: Skipped or degraded data
+                mergedBuckets: Start times of buckets merged into a neighbour for being too small
+            classes: Every class the model output, defectClasses: Classes counted as defects
+            warnings: Non fatal problems met while extracting
+            buckets: Chronological per bucket statistics, each with the following fields:
+                bucketStart, bucketEnd: Local time boundaries, window: current or reference
+                n: Records in the bucket, mergedFrom: How many raw buckets were merged into it
+                classDist: Share of every class, defectRate: Share of defect classes
+                confP50, confMean, confStd, confHist, confQuantiles: Confidence statistics, confHist uses fixed
+                  bins [0,0.1) ... [0.9,1.0] so buckets are comparable
+                belowThresholdRate: Share of predictions below their threshold, thresholdValues: Thresholds seen
+                imageSpecs: Distinct (width, height, channels) seen, elapsedTimeP50: Median inference time
+                nFeedback, feedbackMismatchRate, nFeedbackOther: Human feedback, labels vs comments
+                marginQuantiles, entropyQuantiles, decisionDiffersRate, patchWP50, patchHP50, nearThresholdRate:
+                  Classification only
+                nBoxes, boxesPerImageMean, boxesPerImageStd, boxesPerImageHist, noBoxRate, boxesByClassPerImage,
+                  box: Detection only, box holds normalised geometry quantiles and a log10 area histogram
+            changePoint: Range mode, the split with the largest divergence, with the following fields:
+                bucketIndex, date: Where the after side starts, score: Sum of PSI values used for the search
+                nBefore, nAfter, sidesSufficient: Sample sizes and whether both sides are large enough to trust
+                psiConf, jsConf, ksConf: Confidence divergence (PSI < 0.1 none, 0.1-0.25 moderate, > 0.25 large)
+                psiClass, chi2Class, maxClassPropChange: Class distribution divergence
+                psiBoxesPerImage, ksAreaNorm, ksCxNorm, ksCyNorm: Detection geometry and box count divergence
+                ksMargin, ksEntropy: Classification confidence vector divergence when vectors were stored
+                before, after: Summary of each side including its histograms, so the direction of a move is visible
+            secondaryChangePoints: Further splits found on either side of the primary one
+            comparison: Comparison mode, reference (before) versus current (after) with the changePoint fields
+            maxPairwise: Largest PSI between any two buckets for confidence and classes, with the pair
+            outlierBuckets: Buckets whose value in a series is far from the others (robust z-score above 3.5)
+            trend: Per series Kendall tau, p-value, Theil-Sen slope per bucket, first and last value, and
+              whether the trend is meaningful
+            hardBreaks: Silent configuration changes: image_spec, threshold, backend, classes, elapsed_time
+            flags: Deterministic rule results such as CONFIDENCE_SHIFT, CLASS_SHIFT, BOX_GEOMETRY_SHIFT,
+              THRESHOLD_PRESSURE, TREND_<SERIES>, TRANSIENT_OUTLIER, HARD_BREAK, FEEDBACK_DEGRADATION,
+              INSUFFICIENT_DATA, INSUFFICIENT_BUCKETS
+            preVerdict: stable, suspicious, drift_likely or undetermined, derived from the flags
+            config: Every threshold used, for reproducibility
+    """
+    try:
+        connector = ctx.request_context.lifespan_context.connector
+        return await connector.analyze_data_drift(
+            model_name=model_name,
+            model_version=model_version,
+            start_date=start_date,
+            end_date=end_date,
+            task=task,
+            gbm=gbm,
+            process=process,
+            location=location,
+            equipment_id=equipment_id,
+            mode=mode,
+            bucket=bucket,
+            detail=detail,
+            defect_classes=defect_classes,
+            reference_start=reference_start,
+            reference_end=reference_end
+        )
+    except Exception as e:
+        raise ToolError(f"Failed to analyse data drift: {str(e)}")
