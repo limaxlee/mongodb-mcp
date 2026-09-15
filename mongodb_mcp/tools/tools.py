@@ -839,9 +839,8 @@ async def mongodb_analyze_data_drift(
         mode: str | None = "production",
         bucket: str = "auto",
         detail: str = "full",
-        defect_classes: list[str] | None = None,
-        reference_start: datetime | None = None,
-        reference_end: datetime | None = None
+        reference_start_date: datetime | None = None,
+        reference_end_date: datetime | None = None
 ) -> DriftAnalysisResult:
     """Compute the statistics needed to decide whether an inspection model's input data or behaviour drifted
 
@@ -849,7 +848,7 @@ async def mongodb_analyze_data_drift(
     models are not supported. Two modes exist:
       - Range mode (default): analyses start_date to end_date, splits it into time buckets, searches for the moment
         the output distribution changed the most (change point), for gradual trends, and for outlier buckets.
-      - Comparison mode: when reference_start and reference_end are also given, the reference window is compared
+      - Comparison mode: when reference_start_date and reference_end_date are also given, the reference window is compared
         against the current window at a fixed split instead of searching for one.
     The windows together may cover at most 30 days. Statistics are computed over every prediction of the model, a
     document contributes one record per matching aiResults entry and prediction. For detection models the
@@ -860,7 +859,7 @@ async def mongodb_analyze_data_drift(
     Args:
         model_name: Name of the inspection model, matched exactly together with the version as name/version
         model_version: Version of the inspection model
-        start_date: Start of the analysed (current) window, inclusive
+        start_date: Start of the analysed (current) window, inclusive, UTC like every date in and out of this tool
         end_date: End of the analysed (current) window, exclusive
         task: Task of the model, cls or det, required only when the model string is used for both tasks
         gbm: Manufacturing site the inspections ran at, exact match
@@ -868,64 +867,66 @@ async def mongodb_analyze_data_drift(
         location: Location within the process, exact match
         equipment_id: Id of the equipment the inspections ran on, exact match
         mode: Operating mode of the inspections, production by default, pass null to include every mode
-        bucket: Time bucket size, auto (default), 1h, shift, 1d or 1w; auto picks by range length and volume
+        bucket: Time bucket size, auto (default), 1h, 1d or 1w; auto picks by range length and volume
         detail: full (default) keeps every histogram and quantile per bucket, compact keeps only the scalar series
-        defect_classes: Classes counted in the defect rate, every class except Good by default
-        reference_start: Start of the reference window for comparison mode, inclusive
-        reference_end: End of the reference window for comparison mode, exclusive, must precede start_date
+        reference_start_date: Start of the reference window for comparison mode, inclusive
+        reference_end_date: End of the reference window for comparison mode, exclusive, must precede start_date
 
     Returns:
         Drift analysis with the following fields:
             modelName, modelVersion, task: The analysed model
             mode: range or comparison
             filters: The metadata filters that were applied
-            range, referenceRange: Analysed windows with start, end and length in days
+            range, referenceRange: Analysed windows with startDate, endDate and length in days
             bucket: The resolved bucket size
             status: What could be computed, with the following fields:
                 analysisPossible: Whether a change point or comparison was computed
                 changePointRan, comparisonRan, trendRan, outlierRan: Which analyses ran
-                nBuckets: Number of buckets after merging small ones
+                bucketCount: Number of buckets after merging small ones
             dataQuality: Volume and problems of the scanned data, with the following fields:
-                nDocsScanned: Documents matching the filters
-                nDocsMatched, nEntriesMatched: Documents and aiResults entries that produced records
-                nRecords: Predictions analysed (images for detection)
-                nBoxes: Bounding boxes analysed, detection only
-                nMissingConfidence, nMissingImageSpec, nParseErrors, parseErrorExamples: Skipped or degraded data
+                scannedDocumentCount: Documents matching the filters
+                matchedDocumentCount, matchedEntryCount: Documents and aiResults entries that produced records
+                recordCount: Predictions analysed (images for detection)
+                boxCount: Bounding boxes analysed, detection only
+                missingConfidenceCount, missingImageSpecCount, parseErrorCount, parseErrorExamples: Skipped or degraded data
                 mergedBuckets: Start times of buckets merged into a neighbour for being too small
-            classes: Every class the model output, defectClasses: Classes counted as defects
+            classes: Every class the model output
             warnings: Non fatal problems met while extracting
             buckets: Chronological per bucket statistics, each with the following fields:
-                bucketStart, bucketEnd: Local time boundaries, window: current or reference
-                n: Records in the bucket, mergedFrom: How many raw buckets were merged into it
-                classDist: Share of every class, defectRate: Share of defect classes
-                confP50, confMean, confStd, confHist, confQuantiles: Confidence statistics, confHist uses fixed
+                startDate, endDate: UTC boundaries, window: current or reference
+                recordCount: Records in the bucket, mergedFrom: How many raw buckets were merged into it
+                classDistribution: Share of every class
+                medianConfidence, meanConfidence, stdConfidence, confidenceHistogram, confidenceQuantiles: Confidence statistics, confidenceHistogram uses fixed
                   bins [0,0.1) ... [0.9,1.0] so buckets are comparable
                 belowThresholdRate: Share of predictions below their threshold, thresholdValues: Thresholds seen
-                imageSpecs: Distinct (width, height, channels) seen, elapsedTimeP50: Median inference time
-                nFeedback, feedbackMismatchRate, nFeedbackOther: Human feedback, labels vs comments
-                marginQuantiles, entropyQuantiles, decisionDiffersRate, patchWP50, patchHP50, nearThresholdRate:
+                imageSpecs: Distinct (width, height, channels) seen, medianElapsedTime: Median inference time
+                decisionDiffersRate, medianPatchWidth, medianPatchHeight, nearThresholdRate:
                   Classification only
-                nBoxes, boxesPerImageMean, boxesPerImageStd, boxesPerImageHist, noBoxRate, boxesByClassPerImage,
+                boxCount, meanBoxesPerImage, stdBoxesPerImage, boxesPerImageHistogram, noBoxRate, boxesByClassPerImage,
                   box: Detection only, box holds normalised geometry quantiles and a log10 area histogram
-            changePoint: Range mode, the split with the largest divergence, with the following fields:
+            changePoint: Range mode, the split with the largest divergence, searched over the buckets that are not
+              outliers so that a transient bucket does not read as a persistent shift, with the following fields:
                 bucketIndex, date: Where the after side starts, score: Sum of PSI values used for the search
-                nBefore, nAfter, sidesSufficient: Sample sizes and whether both sides are large enough to trust
-                psiConf, jsConf, ksConf: Confidence divergence (PSI < 0.1 none, 0.1-0.25 moderate, > 0.25 large)
-                psiClass, chi2Class, maxClassPropChange: Class distribution divergence
-                psiBoxesPerImage, ksAreaNorm, ksCxNorm, ksCyNorm: Detection geometry and box count divergence
-                ksMargin, ksEntropy: Classification confidence vector divergence when vectors were stored
+                candidateCount: Split positions the search tried; the p-values below are corrected for that choice
+                beforeCount, afterCount, sidesSufficient: Sample sizes and whether both sides are large enough to trust
+                psiConfidence, jsConfidence, ksConfidence: Confidence divergence (PSI < 0.1 none, 0.1-0.25 moderate, > 0.25 large)
+                psiClass, chi2Class, maxClassProportionChange: Class distribution divergence
+                psiBoxesPerImage, ksNormalizedArea, ksNormalizedCx, ksNormalizedCy: Detection geometry and box count divergence
                 before, after: Summary of each side including its histograms, so the direction of a move is visible
             secondaryChangePoints: Further splits found on either side of the primary one
             comparison: Comparison mode, reference (before) versus current (after) with the changePoint fields
             maxPairwise: Largest PSI between any two buckets for confidence and classes, with the pair
             outlierBuckets: Buckets whose value in a series is far from the others (robust z-score above 3.5)
             trend: Per series Kendall tau, p-value, Theil-Sen slope per bucket, first and last value, and
-              whether the trend is meaningful
-            hardBreaks: Silent configuration changes: image_spec, threshold, backend, classes, elapsed_time
+              whether the trend is meaningful; the series are the scalar bucket fields plus class_share_<class>
+              for every class, no class is treated as good or defect
+            hardBreaks: Silent configuration changes: image_spec, threshold, backend, classes, elapsed_time; a
+              detection threshold is tracked per class and the break carries the className
             flags: Deterministic rule results such as CONFIDENCE_SHIFT, CLASS_SHIFT, BOX_GEOMETRY_SHIFT,
-              THRESHOLD_PRESSURE, TREND_<SERIES>, TRANSIENT_OUTLIER, HARD_BREAK, FEEDBACK_DEGRADATION,
+              THRESHOLD_PRESSURE, TREND_<SERIES>, TREND_CLASS_SHARE, TRANSIENT_OUTLIER, HARD_BREAK,
               INSUFFICIENT_DATA, INSUFFICIENT_BUCKETS
-            preVerdict: stable, suspicious, drift_likely or undetermined, derived from the flags
+            preVerdict: stable, suspicious, drift_likely or undetermined, derived from the flags; trends count per
+              family (confidence, class share, box count, box geometry), not per series
             config: Every threshold used, for reproducibility
     """
     try:
@@ -943,9 +944,8 @@ async def mongodb_analyze_data_drift(
             mode=mode,
             bucket=bucket,
             detail=detail,
-            defect_classes=defect_classes,
-            reference_start=reference_start,
-            reference_end=reference_end
+            reference_start_date=reference_start_date,
+            reference_end_date=reference_end_date
         )
     except Exception as e:
         raise ToolError(f"Failed to analyse data drift: {str(e)}")

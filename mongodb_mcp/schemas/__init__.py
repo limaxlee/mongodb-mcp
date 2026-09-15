@@ -17,6 +17,7 @@ from .datasets import (
     LabelAttributes, TrainingRecord, DatasetDocument, FindDatasetDocumentsResult
 )
 from .drift import (
-    DriftAnalysisResult, BucketSummary, BoxSummary, SplitComparison, SideSummary, TrendStat, OutlierBucket,
-    HardBreak, DataQuality, AnalysisStatus, DateRange, KsResult, Chi2Result, ConfQuantiles, Quantiles, PairwiseMax
+    DriftAnalysisResult, DriftWindows, BoxRecord, Record, Bucket, SideCounts, CompactBucketSummary, BucketSummary,
+    BoxSummary, SplitComparison, SideSummary, TrendStat, OutlierBucket, HardBreak, DataQuality, AnalysisStatus,
+    DateRange, KsResult, Chi2Result, ConfidenceQuantiles, Quantiles, PairwiseMax
 )

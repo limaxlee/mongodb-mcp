@@ -1,18 +1,20 @@
 import logging
 import asyncio
 from typing import Any
-from functools import wraps, partial
+from functools import wraps
 from datetime import datetime
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import TEXT, ASCENDING, DESCENDING
 from pymongo.errors import ConnectionFailure
 
 from common.config import SETTINGS
-from common.constants import LIMIT, CONNECTION_RETRIES, CONNECTION_DELAY, DBCollections, DATASET_EXCLUDED_FIELDS
+from common.constants import (
+    LIMIT, CONNECTION_RETRIES, CONNECTION_DELAY, DBCollections, DATASET_EXCLUDED_FIELDS, AUTO_BUCKET,
+    BucketSize, DriftTask, DriftDetail, DriftWindow
+)
 from mongodb_mcp.utils import preprocess_operation, process_query_result, generate_normalized_regex
 from mongodb_mcp.schemas import *
-from mongodb_mcp.drift import RecordExtractor, analyze_records, validate_windows, resolve_task, utc, DEFAULT_CONFIG
-from mongodb_mcp.connector.drift_query import build_drift_match, build_drift_pipeline
+from mongodb_mcp.drift import DriftAnalyzer, DriftQuery, RecordExtractor, UnsupportedTaskError
 
 logger = logging.getLogger(__name__)
 
@@ -661,24 +663,24 @@ class MongoDBConnector:
             location: str | None = None,
             equipment_id: str | None = None,
             mode: str | None = "production",
-            bucket: str = "auto",
-            detail: str = "full",
-            defect_classes: list[str] | None = None,
-            reference_start: datetime | None = None,
-            reference_end: datetime | None = None
+            bucket: str = AUTO_BUCKET,
+            detail: str = DriftDetail.FULL,
+            reference_start_date: datetime | None = None,
+            reference_end_date: datetime | None = None
     ) -> DriftAnalysisResult:
         """Streams the flattened predictions of one model and runs the drift analysis over them"""
         try:
-            start_date, end_date = utc(start_date), utc(end_date)
-            reference_start = utc(reference_start) if reference_start else None
-            reference_end = utc(reference_end) if reference_end else None
-            validate_windows(start_date, end_date, reference_start, reference_end, DEFAULT_CONFIG)
-            if task is not None:
-                resolve_task([], task)
-            if bucket not in ("auto", "1h", "shift", "1d", "1w"):
-                raise ValueError(f"Unknown bucket {bucket!r}, use auto, 1h, shift, 1d or 1w")
-            if detail not in ("full", "compact"):
-                raise ValueError(f"Unknown detail {detail!r}, use full or compact")
+            windows = DriftWindows(
+                start_date=start_date, end_date=end_date, reference_start_date=reference_start_date, reference_end_date=reference_end_date
+            )
+            if task is not None and task not in list(DriftTask):
+                raise UnsupportedTaskError(task)
+            if bucket != AUTO_BUCKET and bucket not in list(BucketSize):
+                sizes = ", ".join(size.value for size in BucketSize)
+                raise ValueError(f"Unknown bucket {bucket!r}, use {AUTO_BUCKET}, {sizes}")
+            if detail not in list(DriftDetail):
+                levels = ", ".join(level.value for level in DriftDetail)
+                raise ValueError(f"Unknown detail {detail!r}, use {levels}")
 
             if DBCollections.INSPECTIONS not in await self._db.list_collection_names():
                 raise ValueError(f"Collection {DBCollections.INSPECTIONS} doesn't exist")
@@ -686,39 +688,34 @@ class MongoDBConnector:
             model = f"{model_name}/{model_version}"
             filters = {"gbm": gbm, "process": process, "location": location, "equipment_id": equipment_id, "mode": mode}
 
-            extractor = await self._extract_drift_records(model, start_date, end_date, task, filters)
-            reference_extractor = None
-            if reference_start is not None:
-                reference_extractor = await self._extract_drift_records(
-                    model, reference_start, reference_end, task, filters
+            extractor = RecordExtractor(task=task)
+            if windows.comparison:
+                await self._extract_drift_records(
+                    extractor, DriftWindow.REFERENCE, model, windows.reference_start_date, windows.reference_end_date, task, filters
                 )
+            await self._extract_drift_records(
+                extractor, DriftWindow.CURRENT, model, windows.start_date, windows.end_date, task, filters
+            )
 
-            extractors = [item for item in (extractor, reference_extractor) if item is not None]
-            resolved_task = resolve_task(extractors, task)
-            if not any(item.records for item in extractors):
+            resolved_task = extractor.resolve_task(task)
+            if not extractor.records:
                 extractor.warn_once(f"No inspection results found for model {model} in the requested range")
 
-            loop = asyncio.get_running_loop()
-            result = await loop.run_in_executor(None, partial(
-                analyze_records,
+            analyzer = DriftAnalyzer(
                 model_name=model_name,
                 model_version=model_version,
                 task=resolved_task,
                 extractor=extractor,
-                start_date=start_date,
-                end_date=end_date,
+                windows=windows,
                 filters=filters,
-                reference_extractor=reference_extractor,
-                reference_start=reference_start,
-                reference_end=reference_end,
                 bucket=bucket,
-                detail=detail,
-                defect_classes=defect_classes,
-                config=DEFAULT_CONFIG
-            ))
+                detail=detail
+            )
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(None, analyzer.run)
             logger.info(
-                f"Analysed data drift for {model}: {result.data_quality.n_records} records, "
-                f"{result.status.n_buckets} buckets, verdict {result.pre_verdict}"
+                f"Analysed data drift for {model}: {result.data_quality.record_count} records, "
+                f"{result.status.bucket_count} buckets, verdict {result.pre_verdict}"
             )
             return result
         except Exception as e:
@@ -727,33 +724,28 @@ class MongoDBConnector:
 
     async def _extract_drift_records(
             self,
+            extractor: RecordExtractor,
+            window: DriftWindow,
             model: str,
             start_date: datetime,
             end_date: datetime,
             task: str | None,
             filters: dict[str, str | None]
-    ) -> RecordExtractor:
-        match = build_drift_match(
-            model,
-            start_date,
-            end_date,
-            task=task,
-            gbm=filters["gbm"],
-            process=filters["process"],
-            location=filters["location"],
-            equipment_id=filters["equipment_id"],
-            mode=filters["mode"]
-        )
+    ) -> None:
+        """Streams the rows of one window into the extractor"""
+        query = DriftQuery(model, start_date, end_date, task=task, filters=filters)
         collection = self._db[DBCollections.INSPECTIONS]
-        extractor = RecordExtractor(task=task)
-        extractor.quality.n_docs_scanned = await collection.count_documents(match)
+        extractor.quality.scanned_document_count += await collection.count_documents(query.match())
 
-        cursor = collection.aggregate(build_drift_pipeline(match, model, task), allowDiskUse=True)
+        before_count = len(extractor.records)
+        cursor = collection.aggregate(query.pipeline(), allowDiskUse=True)
         async for row in cursor:
-            extractor.add(row)
+            extractor.add(row, window)
 
-        logger.info(f"Extracted {len(extractor.records)} drift records for {model} between {start_date} and {end_date}")
-        return extractor
+        logger.info(
+            f"Extracted {len(extractor.records) - before_count} {window} drift records for {model} "
+            f"between {start_date} and {end_date}"
+        )
 
     @ensure_connection
     async def close(self):
