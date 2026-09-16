@@ -112,12 +112,17 @@ def generate_rows(
         prediction_for_day: Callable[[random.Random, int], dict[str, Any]],
         row_kwargs_for_day: Callable[[int], dict[str, Any]] | None = None,
         seed: int = 7,
-        start: datetime = START
+        start: datetime = START,
+        first_index: int = 0
 ) -> list[dict[str, Any]]:
-    """One row per prediction spread evenly over each day, `prediction_for_day(rng, day)` shapes the prediction"""
+    """One row per prediction spread evenly over each day, `prediction_for_day(rng, day)` shapes the prediction
+
+    Row ids derive from the running index, so a second batch that must not collide with a first one (for example
+    the rows of a reference window) needs a `first_index` past the end of the first batch.
+    """
     rng = random.Random(seed)
     rows = []
-    index = 0
+    index = first_index
     for day in range(days):
         extra = row_kwargs_for_day(day) if row_kwargs_for_day else {}
         for slot in range(per_day):

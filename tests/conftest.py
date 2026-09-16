@@ -321,7 +321,6 @@ def mock_async_mongodb_db(mocker):
 
     collections_by_name = {
         DBCollections.DAILY_MODELS: daily_models,
-        DBCollections.INSPECTIONS_SUMMARY: summaries,
         DBCollections.DATASETS: datasets,
         DBCollections.INSPECTIONS: inspections
     }

@@ -1,16 +1,12 @@
-"""Query building for the data drift analysis over the inspections collection"""
-from typing import Any
 from datetime import datetime
+from typing import Any
+
 from pydantic.alias_generators import to_camel
 
+from common.constants import ModelTasks
 
-class DriftQuery:
-    """Document filter and aggregation pipeline that flatten the inspections of one model to one row per prediction
 
-    The model string is matched exactly so that versions never blend. The filters are exact matches on metadata
-    fields, given with their snake case names and translated to the camel case names of the documents.
-    """
-
+class DriftQueryBuilder:
     def __init__(
             self,
             model: str,
@@ -23,36 +19,33 @@ class DriftQuery:
         self.start_date = start_date
         self.end_date = end_date
         self.task = task
-        self.filters = {key: value for key, value in (filters or {}).items() if value is not None}
+        self.filters = {key: item for key, item in (filters or {}).items() if item is not None}
 
-    def match(self) -> dict[str, Any]:
-        """Document level filter"""
-        element: dict[str, Any] = {"aiModel": self.model}
+    def build(self) -> dict[str, Any]:
+        element = {
+            "aiModel": self.model,
+            "task": {"$in": [ModelTasks.CLASSIFICATION.value, ModelTasks.DETECTION.value]}
+        }
         if self.task:
             element["task"] = self.task
 
-        match: dict[str, Any] = {
+        query = {
             "isDeleted": False,
-            "metadata.createdAt": {"$gte": self.start_date, "$lt": self.end_date},
+            "metadata.createdAt": {"$gte": self.start_date, "$lte": self.end_date},
             "inspectionResult.aiResults": {"$elemMatch": element}
         }
-        for key, value in self.filters.items():
-            match[f"metadata.{to_camel(key)}"] = value
+        for key, item in self.filters.items():
+            query[f"metadata.{to_camel(key)}"] = item
 
-        return match
+        return query
 
-    def pipeline(self) -> list[dict[str, Any]]:
-        """Flattens matching documents to one row per prediction of the analysed model, in chronological order
-
-        The sort happens before any unwind so the createdAt index carries it, and the unwinds preserve the order.
-        Detections stay nested in their prediction so an image row arrives together with its boxes.
-        """
-        entry_match: dict[str, Any] = {"inspectionResult.aiResults.aiModel": self.model}
+    def build_pipeline(self) -> list[dict[str, Any]]:
+        pipeline = {"inspectionResult.aiResults.aiModel": self.model}
         if self.task:
-            entry_match["inspectionResult.aiResults.task"] = self.task
+            pipeline["inspectionResult.aiResults.task"] = self.task
 
         return [
-            {"$match": self.match()},
+            {"$match": self.build()},
             {"$sort": {"metadata.createdAt": 1}},
             {"$project": {
                 "metadata": 1,
@@ -61,7 +54,7 @@ class DriftQuery:
                 "inspectionResult.aiResults": 1
             }},
             {"$unwind": {"path": "$inspectionResult.aiResults", "includeArrayIndex": "entryIndex"}},
-            {"$match": entry_match},
+            {"$match": pipeline},
             {"$unwind": "$inspectionResult.aiResults.predictions"},
             {"$project": {
                 "_id": 1,

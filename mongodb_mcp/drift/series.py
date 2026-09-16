@@ -8,15 +8,12 @@ from mongodb_mcp.drift.summaries import Summarizer
 
 
 class SeriesAnalyzer:
-    """Reads the scalar series out of chronological bucket summaries and tests them for trends and outliers"""
-
     def __init__(self, summarizer: Summarizer):
         self.config = SETTINGS.data_drift
         self.summarizer = summarizer
 
     @staticmethod
     def kind(name: str) -> SeriesKind:
-        """Which practical relevance threshold applies to a series, decided by its name"""
         if name.startswith(CLASS_SHARE_PREFIX):
             return SeriesKind.CLASS_SHARE
         if name.endswith("_rate"):
@@ -26,7 +23,6 @@ class SeriesAnalyzer:
         return SeriesKind.VALUE
 
     def relevant(self, name: str, reference: float, value: float, require_both: bool) -> bool:
-        """Whether a move from reference to value is large enough to matter, statistical significance aside"""
         config = self.config
         change = abs(value - reference)
         kind = self.kind(name)
@@ -39,7 +35,6 @@ class SeriesAnalyzer:
         return change >= config.trend_value_change
 
     def points(self, summaries: Sequence[dict[str, Any]], name: str) -> dict[int, float]:
-        """Bucket index to series value, skipping the buckets where the series is missing"""
         points: dict[int, float] = {}
         for index, summary in enumerate(summaries):
             value = self.summarizer.series_value(summary, name)
@@ -88,7 +83,6 @@ class SeriesAnalyzer:
                 value = values[position]
                 others = values[:position] + values[position + 1:]
                 center = stats.median(others)
-                # A statistically extreme point that moved by a negligible amount is noise, not a transient
                 if z is None or abs(z) <= config.robust_z or center is None:
                     continue
                 if self.relevant(name, center, value, require_both=True):

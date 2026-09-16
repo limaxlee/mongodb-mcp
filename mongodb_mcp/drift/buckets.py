@@ -1,23 +1,15 @@
-"""Cuts the ordered record stream into UTC time buckets"""
 from datetime import datetime, timedelta
 
 from common.config import SETTINGS
-from common.constants import AUTO_BUCKET, BucketSize, DriftWindow, DriftTask
+from common.constants import AUTO_BUCKET, BucketSize, DriftWindowMode, DriftTask
 from mongodb_mcp.schemas import Record, Bucket
 
 
 class BucketBuilder:
-    """Chooses the bucket size, groups records into buckets and merges the ones that are too small
-
-    The warnings raised while choosing and the start times of merged buckets are kept on the instance so the
-    analysis can report them.
-    """
-
     def __init__(self, task: str):
         self.config = SETTINGS.data_drift
         self.min_records = self.config.min_bucket_records_det if task == DriftTask.DETECTION \
             else self.config.min_bucket_records_cls
-        self.warnings: list[str] = []
         self.merged_start_dates: list[datetime] = []
 
     @staticmethod
@@ -32,7 +24,7 @@ class BucketBuilder:
         if bucket == BucketSize.WEEK:
             return midnight - timedelta(days=midnight.weekday())
 
-        raise ValueError(f"Unknown bucket {bucket!r}")
+        raise ValueError(f"Unknown bucket {bucket}")
 
     @staticmethod
     def ceiling(start: datetime, bucket: BucketSize) -> datetime:
@@ -43,11 +35,10 @@ class BucketBuilder:
         if bucket == BucketSize.WEEK:
             return start + timedelta(days=7)
 
-        raise ValueError(f"Unknown bucket {bucket!r}")
+        raise ValueError(f"Unknown bucket {bucket}")
 
     @staticmethod
     def coarsen(bucket: BucketSize) -> BucketSize | None:
-        """The next coarser bucket size, None when the bucket is already the coarsest"""
         sizes = list(BucketSize)
         index = sizes.index(BucketSize(bucket))
         return sizes[index + 1] if index + 1 < len(sizes) else None
@@ -56,10 +47,9 @@ class BucketBuilder:
             self,
             records: list[Record],
             bucket: BucketSize,
-            window: DriftWindow = DriftWindow.CURRENT
+            window: DriftWindowMode = DriftWindowMode.CURRENT
     ) -> list[Bucket]:
-        """Groups records by the UTC bucket they fall in, chronologically ordered"""
-        grouped: dict[datetime, Bucket] = {}
+        grouped = {}
         for record in records:
             start = self.floor(record.created_at, bucket)
             if start not in grouped:
@@ -69,7 +59,6 @@ class BucketBuilder:
         return [grouped[key] for key in sorted(grouped)]
 
     def choose(self, records: list[Record], days: float, requested: str = AUTO_BUCKET) -> BucketSize:
-        """Resolves the bucket size, either the requested one or the automatic rule, never exceeding the bucket cap"""
         if requested != AUTO_BUCKET:
             bucket = BucketSize(requested)
         else:
@@ -90,20 +79,15 @@ class BucketBuilder:
                     continue
                 break
 
-        # Never emit more buckets than the result can reasonably carry
         while len(self.build(records, bucket)) > self.config.max_buckets:
             next_bucket = self.coarsen(bucket)
             if not next_bucket:
                 break
-            self.warnings.append(
-                f"Bucket {bucket} would exceed {self.config.max_buckets} buckets, coarsened to {next_bucket}"
-            )
             bucket = next_bucket
 
         return bucket
 
     def merge_small(self, buckets: list[Bucket]) -> list[Bucket]:
-        """Merges every bucket below the minimum into its next neighbour (previous for the last one)"""
         items = [item.model_copy(update={"records": list(item.records)}) for item in buckets]
 
         index = 0

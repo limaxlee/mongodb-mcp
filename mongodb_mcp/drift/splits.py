@@ -1,4 +1,3 @@
-"""Before/after comparison of two groups of records, and the search for the split that separates them most"""
 from typing import Any, Sequence
 from datetime import datetime
 
@@ -10,14 +9,12 @@ from mongodb_mcp.drift.summaries import Summarizer
 
 
 class SplitFinder:
-    """Divergence between two sides and the best split of a bucket sequence, for one summarizer"""
-
     def __init__(self, summarizer: Summarizer):
         self.config = SETTINGS.data_drift
         self.summarizer = summarizer
         self.detection = summarizer.detection
-        self.min_side_records = self.config.min_side_records_det if self.detection \
-            else self.config.min_side_records_cls
+        self.min_side_records = SETTINGS.data_drift.min_side_records_det if self.detection \
+            else SETTINGS.data_drift.min_side_records_cls
 
     def sides_sufficient(self, before: SideCounts, after: SideCounts) -> bool:
         if before.record_count < self.min_side_records or after.record_count < self.min_side_records:
@@ -27,7 +24,6 @@ class SplitFinder:
         return True
 
     def score(self, before: SideCounts, after: SideCounts) -> float:
-        """Sum of the PSI values of every distribution the split is searched on"""
         eps = self.config.eps
         score = stats.psi(stats.proportions(before.confidence_counts), stats.proportions(after.confidence_counts), eps)
         keys = sorted(set(before.class_counts) | set(after.class_counts))
@@ -57,11 +53,6 @@ class SplitFinder:
             bucket_index: int | None = None,
             candidate_count: int = 1
     ) -> dict[str, Any]:
-        """Full divergence report between two groups of records, computed from the records themselves
-
-        A split chosen among candidate_count positions carries p-values corrected for that choice (Bonferroni), since
-        the maximum of many noisy tests always looks more significant than a single test would.
-        """
         eps = self.config.eps
         summarizer = self.summarizer
         before_counts = summarizer.side_counts(before)
@@ -117,15 +108,9 @@ class SplitFinder:
         return report
 
     def candidate_count(self, bucket_count: int) -> int:
-        """How many split positions the search over bucket_count tries"""
         return max(bucket_count - 2 * self.config.min_segment_buckets + 1, 1)
 
     def best_split(self, counts: Sequence[SideCounts]) -> int | None:
-        """Index k maximising the divergence between buckets[:k] and buckets[k:], preferring sufficient sides
-
-        When no split has enough records on both sides the best insufficient split is returned so the reader still
-        sees where the largest movement is, and the flags stay silent. None when the sequence is too short.
-        """
         total = len(counts)
         min_seg = self.config.min_segment_buckets
         if total < 2 * min_seg:
@@ -154,7 +139,6 @@ class SplitFinder:
         return best_sufficient if best_sufficient is not None else best_any
 
     def primary(self, buckets: Sequence[Bucket], counts: Sequence[SideCounts]) -> dict[str, Any] | None:
-        """The split with the largest divergence over the whole bucket sequence"""
         return self._report(buckets, counts, offset=0)
 
     def secondary(
@@ -163,7 +147,6 @@ class SplitFinder:
             counts: Sequence[SideCounts],
             primary: dict[str, Any]
     ) -> list[dict[str, Any]]:
-        """At most one sufficient split on each side of the primary one (one level of binary segmentation)"""
         k = primary["bucket_index"]
         reports: list[dict[str, Any]] = []
         for lo, hi in ((0, k), (k, len(buckets))):

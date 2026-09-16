@@ -3,7 +3,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, NonNegativeInt, NonNegativeFloat
 from pydantic.alias_generators import to_camel
 
-from common.constants import ModelTasks, InspectionMode
+from common.constants import ModelTasks
 
 
 class InspectionModelInfo(BaseModel):
@@ -46,7 +46,7 @@ class InspectionSummaryDocument(BaseModel):
     model_version: str
     gbm: str
     process: str
-    mode: InspectionMode | None = None
+    mode: str | None = None
     date: datetime
     location: str
     equipment_id: str

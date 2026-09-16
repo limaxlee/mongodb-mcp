@@ -153,13 +153,8 @@ class Summarizer:
     @staticmethod
     def _classification_summary(records: Sequence[Record]) -> dict[str, Any]:
         near = [record.near_threshold for record in records if record.near_threshold is not None]
-        patch_width = [record.patch_width for record in records if record.patch_width is not None]
-        patch_height = [record.patch_height for record in records if record.patch_height is not None]
 
         return {
-            "decision_differs_rate": sum(r.decision_differs for r in records) / len(records) if records else None,
-            "median_patch_width": stats.median(patch_width),
-            "median_patch_height": stats.median(patch_height),
             "near_threshold_rate": sum(near) / len(near) if near else None
         }
 

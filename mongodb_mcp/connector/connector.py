@@ -9,12 +9,12 @@ from pymongo.errors import ConnectionFailure
 
 from common.config import SETTINGS
 from common.constants import (
-    LIMIT, CONNECTION_RETRIES, CONNECTION_DELAY, DBCollections, DATASET_EXCLUDED_FIELDS, AUTO_BUCKET,
-    BucketSize, DriftTask, DriftDetail, DriftWindow
+    LIMIT, CONNECTION_RETRIES, CONNECTION_DELAY, DBCollections, AUTO_BUCKET,
+    BucketSize, DriftDetail, DriftWindowMode, ModelTasks
 )
 from mongodb_mcp.utils import preprocess_operation, process_query_result, generate_normalized_regex
 from mongodb_mcp.schemas import *
-from mongodb_mcp.drift import DriftAnalyzer, DriftQuery, RecordExtractor, UnsupportedTaskError
+from mongodb_mcp.drift import DriftAnalyzer, DriftQueryBuilder, DriftWindow, RecordExtractor
 
 logger = logging.getLogger(__name__)
 
@@ -397,8 +397,11 @@ class MongoDBConnector:
             logger.exception(f"Failed to execute aggregation pipeline on {collection_name} collection: {str(e)}")
             raise
 
-    @staticmethod
-    def _build_date_range_filter(start_date: datetime | None = None, end_date: datetime | None = None) -> dict[str, Any]:
+    def _build_date_range_filter(
+            self,
+            start_date: datetime | None = None,
+            end_date: datetime | None = None
+    ) -> dict[str, Any]:
         date_filter = {}
 
         if start_date:
@@ -407,23 +410,6 @@ class MongoDBConnector:
             date_filter["$lte"] = end_date
 
         return date_filter
-
-    @staticmethod
-    def _exclude_fields(projection: dict[str, Any] | None, fields: tuple[str, ...]) -> dict[str, Any]:
-        projection = dict(projection) if projection else {}
-        is_inclusion = any(value for key, value in projection.items() if key != "_id")
-
-        for field in fields:
-            if is_inclusion:
-                projection.pop(field, None)
-            else:
-                projection[field] = 0
-
-        # An inclusion projection that only named excluded fields would otherwise return every field
-        if not projection:
-            projection = {field: 0 for field in fields}
-
-        return projection
 
     def _build_inspection_query(
             self,
@@ -501,61 +487,6 @@ class MongoDBConnector:
             raise
 
     @ensure_connection
-    async def find_inspection_summary_documents(
-            self,
-            model_name: str | None = None,
-            model_version: str | None = None,
-            gbm: str | None = None,
-            task: str | None = None,
-            mode: str | None = None,
-            process: str | None = None,
-            location: str | None = None,
-            equipment_id: str | None = None,
-            product_id: str | None = None,
-            start_date: datetime | None = None,
-            end_date: datetime | None = None,
-            projection: dict[str, Any] | None = None,
-            limit: int = LIMIT,
-            sort_field: str | None = None,
-            sort_order: int = ASCENDING
-    ) -> FindInspectionSummaryDocumentsResult:
-        try:
-            query = self._build_inspection_query(
-                model_name=model_name,
-                model_version=model_version,
-                gbm=gbm,
-                task=task,
-                mode=mode,
-                process=process,
-                start_date=start_date,
-                end_date=end_date
-            )
-
-            if location:
-                query["location"] = generate_normalized_regex(location)
-            if equipment_id:
-                query["equipmentId"] = equipment_id
-            if product_id:
-                query["productId"] = product_id
-
-            if DBCollections.INSPECTIONS_SUMMARY not in await self._db.list_collection_names():
-                raise ValueError(f"Collection {DBCollections.INSPECTIONS_SUMMARY} doesn't exist")
-
-            cursor = self._db[DBCollections.INSPECTIONS_SUMMARY].find(query, projection=projection)
-            if sort_field:
-                cursor = cursor.sort(sort_field, sort_order)
-
-            documents = await cursor.to_list(length=limit)
-            logger.info(f"Found {len(documents)} summary documents using query {query}")
-
-            return FindInspectionSummaryDocumentsResult(
-                summaries=[InspectionSummaryDocument(**process_query_result(document)) for document in documents]
-            )
-        except Exception as e:
-            logger.exception(f"Failed to find inspection result summaries: {str(e)}")
-            raise
-
-    @ensure_connection
     async def find_dataset_family_documents(
             self,
             dataset_family_name: str | None = None,
@@ -568,7 +499,6 @@ class MongoDBConnector:
             sort_order: int = ASCENDING
     ) -> FindDatasetFamilyDocumentsResult:
         try:
-            # Dataset families share the collection with dataset documents, only families carry a family name
             query = {"datasetFamilyName": {"$exists": True}}
 
             if dataset_family_name:
@@ -592,62 +522,7 @@ class MongoDBConnector:
                 families=[DatasetFamilyDocument(**process_query_result(document)) for document in documents]
             )
         except Exception as e:
-            logger.exception(f"Failed to find dataset families: {str(e)}")
-            raise
-
-    @ensure_connection
-    async def find_dataset_documents(
-            self,
-            name: str | None = None,
-            version: str | None = None,
-            task: str | None = None,
-            created_by: str | None = None,
-            is_finalized: bool | None = None,
-            is_used: bool | None = None,
-            start_date: datetime | None = None,
-            end_date: datetime | None = None,
-            projection: dict[str, Any] | None = None,
-            limit: int = LIMIT,
-            sort_field: str | None = None,
-            sort_order: int = ASCENDING
-    ) -> FindDatasetDocumentsResult:
-        try:
-            # Dataset documents share the collection with dataset families, only documents carry a schema version
-            query = {"schemaVersion": {"$exists": True}}
-
-            if name:
-                query["name"] = generate_normalized_regex(name)
-            if version:
-                query["version"] = generate_normalized_regex(version)
-            if task:
-                query["task"] = task
-            if created_by:
-                query["createdBy"] = generate_normalized_regex(created_by)
-            if is_finalized is not None:
-                query["isFinalized"] = is_finalized
-            if is_used is not None:
-                query["isUsed"] = is_used
-            if start_date or end_date:
-                query["createdAt"] = self._build_date_range_filter(start_date=start_date, end_date=end_date)
-
-            # The data map holds an entry per data sample and the last job is transient, both are never returned
-            projection = self._exclude_fields(projection, DATASET_EXCLUDED_FIELDS)
-
-            if DBCollections.DATASETS not in await self._db.list_collection_names():
-                raise ValueError(f"Collection {DBCollections.DATASETS} doesn't exist")
-
-            cursor = self._db[DBCollections.DATASETS].find(query, projection=projection)
-            if sort_field:
-                cursor = cursor.sort(sort_field, sort_order)
-
-            documents = await cursor.to_list(length=limit)
-            logger.info(f"Found {len(documents)} dataset documents using query {query}")
-
-            return FindDatasetDocumentsResult(
-                datasets=[DatasetDocument(**process_query_result(document)) for document in documents]
-            )
-        except Exception as e:
-            logger.exception(f"Failed to find datasets: {str(e)}")
+            logger.exception(f"Failed to find dataset family documents: {str(e)}")
             raise
 
     @ensure_connection
@@ -662,25 +537,19 @@ class MongoDBConnector:
             process: str | None = None,
             location: str | None = None,
             equipment_id: str | None = None,
-            mode: str | None = "production",
+            mode: str | None = None,
             bucket: str = AUTO_BUCKET,
             detail: str = DriftDetail.FULL,
             reference_start_date: datetime | None = None,
             reference_end_date: datetime | None = None
     ) -> DriftAnalysisResult:
-        """Streams the flattened predictions of one model and runs the drift analysis over them"""
         try:
-            windows = DriftWindows(
-                start_date=start_date, end_date=end_date, reference_start_date=reference_start_date, reference_end_date=reference_end_date
-            )
-            if task is not None and task not in list(DriftTask):
-                raise UnsupportedTaskError(task)
+            if task is not None and task == ModelTasks.SEGMENTATION:
+                raise ValueError(f"Unsupported task {task} for drift analysis: supported tasks are cls and det")
             if bucket != AUTO_BUCKET and bucket not in list(BucketSize):
-                sizes = ", ".join(size.value for size in BucketSize)
-                raise ValueError(f"Unknown bucket {bucket!r}, use {AUTO_BUCKET}, {sizes}")
+                raise ValueError(f"Unsupported bucket {bucket} for drift analysis: supported buckets are 1h, 1d, 1w")
             if detail not in list(DriftDetail):
-                levels = ", ".join(level.value for level in DriftDetail)
-                raise ValueError(f"Unknown detail {detail!r}, use {levels}")
+                raise ValueError(f"Unsupported detail {detail} for drift analysis: supported details are full, compact")
 
             if DBCollections.INSPECTIONS not in await self._db.list_collection_names():
                 raise ValueError(f"Collection {DBCollections.INSPECTIONS} doesn't exist")
@@ -689,63 +558,79 @@ class MongoDBConnector:
             filters = {"gbm": gbm, "process": process, "location": location, "equipment_id": equipment_id, "mode": mode}
 
             extractor = RecordExtractor(task=task)
-            if windows.comparison:
-                await self._extract_drift_records(
-                    extractor, DriftWindow.REFERENCE, model, windows.reference_start_date, windows.reference_end_date, task, filters
+            drift_window = DriftWindow(
+                start_date=start_date,
+                end_date=end_date,
+                reference_start_date=reference_start_date,
+                reference_end_date=reference_end_date
+            )
+            drift_window.validate()
+            if drift_window.comparison:
+                await self._extract_inspection_records_for_drift(
+                    extractor=extractor,
+                    window_mode=DriftWindowMode.REFERENCE,
+                    start_date=drift_window.reference_start_date,
+                    end_date=drift_window.reference_end_date,
+                    model=model,
+                    task=task,
+                    filters=filters
                 )
-            await self._extract_drift_records(
-                extractor, DriftWindow.CURRENT, model, windows.start_date, windows.end_date, task, filters
+            await self._extract_inspection_records_for_drift(
+                extractor=extractor,
+                window_mode=DriftWindowMode.CURRENT,
+                start_date=drift_window.start_date,
+                end_date=drift_window.end_date,
+                model=model,
+                task=task,
+                filters=filters
             )
 
-            resolved_task = extractor.resolve_task(task)
             if not extractor.records:
-                extractor.warn_once(f"No inspection results found for model {model} in the requested range")
+                raise ValueError(f"No inspection results found for model {model} in the requested time window")
 
             analyzer = DriftAnalyzer(
                 model_name=model_name,
                 model_version=model_version,
-                task=resolved_task,
+                task=extractor.get_task(),
                 extractor=extractor,
-                windows=windows,
+                windows=drift_window,
                 filters=filters,
                 bucket=bucket,
                 detail=detail
             )
-            loop = asyncio.get_running_loop()
-            result = await loop.run_in_executor(None, analyzer.run)
-            logger.info(
-                f"Analysed data drift for {model}: {result.data_quality.record_count} records, "
-                f"{result.status.bucket_count} buckets, verdict {result.pre_verdict}"
-            )
+            result = await asyncio.get_running_loop().run_in_executor(None, analyzer.run)
+            logger.info(f"Analysed data drift for {model}: analyzed {result.data_quality.record_count} records")
+
             return result
         except Exception as e:
             logger.exception(f"Failed to analyse data drift for {model_name}/{model_version}: {str(e)}")
             raise
 
-    async def _extract_drift_records(
+    async def _extract_inspection_records_for_drift(
             self,
             extractor: RecordExtractor,
-            window: DriftWindow,
-            model: str,
+            window_mode: DriftWindowMode,
             start_date: datetime,
             end_date: datetime,
+            model: str,
             task: str | None,
             filters: dict[str, str | None]
     ) -> None:
-        """Streams the rows of one window into the extractor"""
-        query = DriftQuery(model, start_date, end_date, task=task, filters=filters)
-        collection = self._db[DBCollections.INSPECTIONS]
-        extractor.quality.scanned_document_count += await collection.count_documents(query.match())
-
-        before_count = len(extractor.records)
-        cursor = collection.aggregate(query.pipeline(), allowDiskUse=True)
-        async for row in cursor:
-            extractor.add(row, window)
-
-        logger.info(
-            f"Extracted {len(extractor.records) - before_count} {window} drift records for {model} "
-            f"between {start_date} and {end_date}"
+        query_builder = DriftQueryBuilder(
+            model=model,
+            start_date=start_date,
+            end_date=end_date,
+            task=task,
+            filters=filters
         )
+        query = query_builder.build()
+        extractor.quality.scanned_document_count += await self._db[DBCollections.INSPECTIONS].count_documents(query)
+        print(query)
+        cursor = self._db[DBCollections.INSPECTIONS].aggregate(query_builder.build_pipeline(), allowDiskUse=True)
+        async for item in cursor:
+            extractor.add_record(item, window_mode)
+
+        logger.info(f"Extracted {len(extractor.records)} drift records for {model} between {start_date} and {end_date}")
 
     @ensure_connection
     async def close(self):

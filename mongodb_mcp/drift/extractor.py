@@ -1,149 +1,103 @@
-"""Turns flattened inspection rows into the flat records every later statistic is computed from
-
-A row is one prediction of one matched aiResults entry, as produced by the aggregation pipeline of DriftQuery.
-Extraction never raises on a malformed row, it counts the problem and moves on.
-"""
 import logging
 from typing import Any
 
 from common.config import SETTINGS
-from common.constants import DriftTask, DriftWindow
+from common.constants import DriftWindowMode, ModelTasks
 from mongodb_mcp.utils import to_utc
 from mongodb_mcp.schemas import Record, BoxRecord, DataQuality
 
 logger = logging.getLogger(__name__)
 
 
-class UnsupportedTaskError(ValueError):
-    def __init__(self, task: Any):
-        supported = ", ".join(item.value for item in DriftTask)
-        super().__init__(f"Task {task!r} is not supported for drift analysis, supported tasks are {supported}")
-
-
 class RecordExtractor:
-    """Accumulates the records of both windows from flattened rows and tracks everything needed for data quality"""
-
     def __init__(self, task: str | None = None):
-        self.requested_task = task
-        self.records: list[Record] = []
+        self.target_task = task
+        self.records = []
         self.quality = DataQuality()
-        self.warnings: list[str] = []
-        self.tasks_seen: set[str] = set()
-        self.classes_seen: list[str] = []
-        self._warned: set[str] = set()
-        self._matched_docs: set[str] = set()
-        self._matched_entries: set[str] = set()
+        self.classes = []
+        self._matched_docs = set()
+        self._matched_entries = set()
+        self._seen_predictions = set()
 
-    def warn_once(self, message: str) -> None:
-        if message not in self._warned:
-            self._warned.add(message)
-            self.warnings.append(message)
+    def get_task(self) -> str:
+        return self.target_task
 
-    def resolve_task(self, requested: str | None = None) -> str:
-        """The task to analyse, either the requested one or the single task seen in the rows"""
-        if requested is not None:
-            if requested not in list(DriftTask):
-                raise UnsupportedTaskError(requested)
-            return requested
-        if len(self.tasks_seen) > 1:
-            raise ValueError(f"The model has multiple tasks {sorted(self.tasks_seen)}, specify task")
-        return next(iter(self.tasks_seen)) if self.tasks_seen else DriftTask.CLASSIFICATION.value
-
-    def add(self, row: dict[str, Any], window: DriftWindow = DriftWindow.CURRENT) -> Record | None:
-        inspection_id = str(row.get("_id", ""))
+    def add_record(self, item: dict[str, Any], window: DriftWindowMode = DriftWindowMode.CURRENT):
+        inspection_id = str(item.get("_id", ""))
         try:
-            record = self._extract(row, inspection_id, window)
-        except UnsupportedTaskError:
-            raise
-        except Exception as e:  # never let one bad row abort the analysis
+            record = self._extract(item, inspection_id, window)
+            if record is not None:
+                self.records.append(record)
+        except Exception as e:
             self.quality.parse_error_count += 1
             if len(self.quality.parse_error_examples) < SETTINGS.data_drift.max_parse_error_examples:
                 self.quality.parse_error_examples.append(inspection_id)
-            logger.debug(f"Skipped malformed inspection row {inspection_id}: {e}")
+            logger.warning(f"Skipped malformed inspection row {inspection_id}: {e}")
+            return
+
+    def _extract(self, item: dict[str, Any], inspection_id: str, window: DriftWindowMode) -> Record | None:
+        task = item.get("task")
+        if not self.target_task:
+            self.target_task = task
+        if self.target_task and task != self.target_task:
             return None
 
-        if record is not None:
-            self.records.append(record)
-        return record
-
-    def _extract(self, row: dict[str, Any], inspection_id: str, window: DriftWindow) -> Record | None:
-        task = row.get("task")
-        if task not in list(DriftTask):
-            raise UnsupportedTaskError(task)
-        if self.requested_task and task != self.requested_task:
+        prediction = item.get("prediction") or {}
+        entry_index = int(item.get("entryIndex", 0) or 0)
+        prediction_key = f"{inspection_id}:{entry_index}:{prediction.get('predictionId')}"
+        if prediction_key in self._seen_predictions:
             return None
+        self._seen_predictions.add(prediction_key)
 
-        self.tasks_seen.add(task)
         self._matched_docs.add(inspection_id)
-        self._matched_entries.add(f"{inspection_id}:{int(row.get('entryIndex', 0) or 0)}")
+        self._matched_entries.add(f"{inspection_id}:{entry_index}")
         self.quality.matched_document_count = len(self._matched_docs)
         self.quality.matched_entry_count = len(self._matched_entries)
 
-        schema_version = row.get("schemaVersion")
-        if schema_version not in (None, "1.0"):
-            self.warn_once(f"Unknown inspection schema version {schema_version}, extracted on a best effort basis")
+        row_classes = [str(name) for name in (item.get("classes") or [])]
+        for name in row_classes:
+            if name not in self.classes:
+                self.classes.append(name)
 
-        classes = [str(name) for name in (row.get("classes") or [])]
-        for name in classes:
-            if name not in self.classes_seen:
-                self.classes_seen.append(name)
+        created_at = to_utc(item.get("createdAt"))
 
-        prediction = row.get("prediction") or {}
-        created_at = to_utc(row.get("createdAt"))
-        if created_at is None:
-            raise ValueError("Missing createdAt")
+        image_width, image_height, image_channels = self._image_spec(item.get("dataSpec"), prediction.get("fileIndex"))
 
-        image_width, image_height, image_channels = self._image_spec(row.get("dataSpec"), prediction.get("fileIndex"))
-
-        patch_spec = prediction.get("patchSpec") or {}
-        is_patch = bool(prediction.get("isPatch", False))
-        patch_width = patch_height = None
-        if is_patch and all(key in patch_spec for key in ("x1", "x2", "y1", "y2")):
-            patch_width = float(patch_spec["x2"]) - float(patch_spec["x1"])
-            patch_height = float(patch_spec["y2"]) - float(patch_spec["y1"])
-
-        fields: dict[str, Any] = {
+        fields = {
             "window": window,
             "inspection_id": inspection_id,
             "prediction_id": self._as_int(prediction.get("predictionId")),
             "created_at": created_at,
-            "gbm": row.get("gbm"),
-            "process": row.get("process"),
-            "location": row.get("location"),
-            "equipment_id": row.get("equipmentId"),
-            "product_id": row.get("productId"),
-            "mode": row.get("mode"),
-            "backend": row.get("backend"),
-            "classes": classes,
+            "gbm": item.get("gbm"),
+            "process": item.get("process"),
+            "location": item.get("location"),
+            "equipment_id": item.get("equipmentId"),
+            "product_id": item.get("productId"),
+            "mode": item.get("mode"),
+            "backend": item.get("backend"),
+            "classes": row_classes,
             "threshold": self._as_float(prediction.get("threshold")),
             "elapsed_time": self._as_float(prediction.get("elapsedTime")),
-            "is_patch": is_patch,
-            "patch_width": patch_width,
-            "patch_height": patch_height,
             "image_width": image_width,
             "image_height": image_height,
             "image_channels": image_channels
         }
 
-        if task == DriftTask.CLASSIFICATION:
-            fields.update(self._classification_fields(prediction, classes, fields["threshold"]))
+        if task == ModelTasks.CLASSIFICATION:
+            fields.update(self._get_cls_field(prediction, fields["threshold"]))
         else:
-            fields.update(self._detection_fields(prediction, classes, fields["threshold"], image_width, image_height))
+            fields.update(self._get_det_field(prediction, row_classes, fields["threshold"], image_width, image_height))
 
         return Record(**fields)
 
-    def _classification_fields(
+    def _get_cls_field(
             self,
             prediction: dict[str, Any],
-            classes: list[str],
             threshold: float | None
     ) -> dict[str, Any]:
-        label = str(prediction.get("prediction"))
-        decision = prediction.get("decision")
-        if label not in classes:
-            self.warn_once(f"Prediction class {label!r} is not in the model classes")
+        label = prediction.get("prediction")
 
-        max_confidence = self.normalize_confidence(prediction.get("confidence"))
+        max_confidence = self.get_confidence(prediction.get("confidence"))
         if max_confidence is None:
             self.quality.missing_confidence_count += 1
 
@@ -154,14 +108,12 @@ class RecordExtractor:
 
         return {
             "prediction": label,
-            "decision": decision,
             "max_confidence": max_confidence,
             "below_threshold": below_threshold,
-            "near_threshold": near_threshold,
-            "decision_differs": decision is not None and decision != label
+            "near_threshold": near_threshold
         }
 
-    def _detection_fields(
+    def _get_det_field(
             self,
             prediction: dict[str, Any],
             classes: list[str],
@@ -169,9 +121,9 @@ class RecordExtractor:
             image_width: int | None,
             image_height: int | None
     ) -> dict[str, Any]:
-        boxes: list[BoxRecord] = []
-        for detection in prediction.get("detections") or []:
-            box = self._extract_box(detection, classes, image_width, image_height)
+        boxes = []
+        for detection in prediction.get("detections", []):
+            box = self._extract_box(detection, image_width, image_height)
             if box is not None:
                 boxes.append(box)
 
@@ -180,7 +132,6 @@ class RecordExtractor:
             box_count_by_class[box.prediction] = box_count_by_class.get(box.prediction, 0) + 1
 
         confidences = [box.max_confidence for box in boxes if box.max_confidence is not None]
-        # A detection threshold usually lives on the boxes, the record keeps the first one seen for hard break scanning
         if threshold is None:
             thresholds = [box.threshold for box in boxes if box.threshold is not None]
             threshold = thresholds[0] if thresholds else None
@@ -198,7 +149,6 @@ class RecordExtractor:
     def _extract_box(
             self,
             detection: dict[str, Any],
-            classes: list[str],
             image_width: int | None,
             image_height: int | None
     ) -> BoxRecord | None:
@@ -220,10 +170,8 @@ class RecordExtractor:
             normalized_cx, normalized_cy = cx / image_width, cy / image_height
 
         label = str(detection.get("prediction"))
-        if label not in classes:
-            self.warn_once(f"Prediction class {label!r} is not in the model classes")
 
-        max_confidence = self.normalize_confidence(detection.get("confidence"))
+        max_confidence = self.get_confidence(detection.get("confidence"))
         if max_confidence is None:
             self.quality.missing_confidence_count += 1
         threshold = self._as_float(detection.get("threshold"))
@@ -253,17 +201,14 @@ class RecordExtractor:
 
         return width, height, self._as_int(spec.get("channels"))
 
-    @staticmethod
-    def normalize_confidence(confidence: Any) -> float | None:
-        """A list of confidences collapses to its maximum, the other values carry no information and are ignored"""
-        if isinstance(confidence, (list, tuple)):
-            values = [float(value) for value in confidence if isinstance(value, (int, float)) and not isinstance(value, bool)]
+    def get_confidence(self, confidence: Any) -> float | None:
+        """A list of confidences collapses to its maximum, anything that is not a number becomes None"""
+        if isinstance(confidence, list):
+            values = [self._as_float(value) for value in confidence]
+            values = [value for value in values if value is not None]
             return max(values) if values else None
 
-        if isinstance(confidence, (int, float)) and not isinstance(confidence, bool):
-            return float(confidence)
-
-        return None
+        return self._as_float(confidence)
 
     @staticmethod
     def _as_float(value: Any) -> float | None:

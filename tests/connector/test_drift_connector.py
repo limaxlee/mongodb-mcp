@@ -1,7 +1,7 @@
 import pytest
 from datetime import datetime, timedelta, timezone
 
-from common.constants import DBCollections, DriftFlag, PreVerdict
+from common.constants import DBCollections, DriftFlag
 from mongodb_mcp.schemas import DriftAnalysisResult
 from tests.conftest import DRIFT_ROWS, AsyncRowCursor
 from tests.drift.synthetic import START
@@ -19,7 +19,7 @@ class TestAnalyzeDataDrift:
 
     @pytest.mark.asyncio
     async def test_range_mode(self, drift_connector):
-        result = await drift_connector.analyze_data_drift("MetalCls", "1.0", START, END, gbm="SEV")
+        result = await drift_connector.analyze_data_drift("MetalCls", "1.0", START, END, gbm="SEV", mode="production")
 
         assert isinstance(result, DriftAnalysisResult)
         assert result.model_name == "MetalCls" and result.model_version == "1.0"
@@ -32,9 +32,11 @@ class TestAnalyzeDataDrift:
 
         collection = drift_connector._mock_db[DBCollections.INSPECTIONS]
         match = collection.count_documents.call_args[0][0]
-        assert match["inspectionResult.aiResults"] == {"$elemMatch": {"aiModel": "MetalCls/1.0"}}
+        assert match["inspectionResult.aiResults"] == {
+            "$elemMatch": {"aiModel": "MetalCls/1.0", "task": {"$in": ["cls", "det"]}}
+        }
         assert match["metadata.gbm"] == "SEV" and match["metadata.mode"] == "production"
-        assert match["metadata.createdAt"] == {"$gte": START, "$lt": END}
+        assert match["metadata.createdAt"] == {"$gte": START, "$lte": END}
         assert collection.aggregate.call_args.kwargs == {"allowDiskUse": True}
         assert collection.aggregate.call_args[0][0][0]["$match"] == match
 
@@ -47,20 +49,35 @@ class TestAnalyzeDataDrift:
         assert result.range.start_date.tzinfo == timezone.utc
 
     @pytest.mark.asyncio
-    async def test_comparison_mode_queries_both_windows(self, drift_connector):
+    async def test_comparison_mode_queries_both_windows(self, mocker, drift_connector):
+        collection = drift_connector._mock_db[DBCollections.INSPECTIONS]
+        reference_rows = [dict(row, _id=f"ref-{row['_id']}") for row in DRIFT_ROWS]
+        collection.aggregate = mocker.MagicMock(
+            side_effect=[AsyncRowCursor(reference_rows), AsyncRowCursor(DRIFT_ROWS)]
+        )
+
         result = await drift_connector.analyze_data_drift(
             "MetalCls", "1.0", START, END, reference_start_date=START - timedelta(days=7), reference_end_date=START
         )
-        collection = drift_connector._mock_db[DBCollections.INSPECTIONS]
 
         assert result.mode == "comparison"
         assert collection.aggregate.call_count == 2
         assert collection.count_documents.await_count == 2
         first_match = collection.count_documents.await_args_list[0][0][0]
-        assert first_match["metadata.createdAt"] == {"$gte": START - timedelta(days=7), "$lt": START}
+        assert first_match["metadata.createdAt"] == {"$gte": START - timedelta(days=7), "$lte": START}
         assert result.data_quality.scanned_document_count == 2 * len(DRIFT_ROWS)
         assert result.data_quality.record_count == 2 * len(DRIFT_ROWS)
         assert result.comparison is not None and result.change_point is None
+
+    @pytest.mark.asyncio
+    async def test_boundary_document_is_counted_once(self, mocker, drift_connector):
+        # The same rows come back from both window queries, as a document on the shared boundary would
+        result = await drift_connector.analyze_data_drift(
+            "MetalCls", "1.0", START, END, reference_start_date=START - timedelta(days=7), reference_end_date=START
+        )
+        assert result.data_quality.record_count == len(DRIFT_ROWS)
+        assert result.data_quality.matched_document_count == len(DRIFT_ROWS)
+        assert all(bucket.window == "reference" for bucket in result.buckets)
 
     @pytest.mark.asyncio
     async def test_mode_none_includes_every_mode(self, drift_connector):
@@ -80,23 +97,20 @@ class TestAnalyzeDataDrift:
         collection.count_documents = mocker.AsyncMock(return_value=0)
         collection.aggregate = mocker.MagicMock(return_value=AsyncRowCursor([]))
 
-        result = await drift_connector.analyze_data_drift("MetalCls", "1.0", START, END, task="det")
-        assert result.pre_verdict == PreVerdict.UNDETERMINED
-        assert result.task == "det"
-        assert result.data_quality.matched_document_count == 0
-        assert any("No inspection results found" in message for message in result.warnings)
+        with pytest.raises(ValueError, match="No inspection results found"):
+            await drift_connector.analyze_data_drift("MetalCls", "1.0", START, END, task="det")
 
     @pytest.mark.asyncio
     async def test_validation_errors(self, drift_connector):
-        with pytest.raises(ValueError, match="before end_date"):
+        with pytest.raises(ValueError, match="before end date"):
             await drift_connector.analyze_data_drift("MetalCls", "1.0", END, START)
-        with pytest.raises(ValueError, match="maximum is 30"):
+        with pytest.raises(ValueError, match="max time window is 30"):
             await drift_connector.analyze_data_drift("MetalCls", "1.0", START, START + timedelta(days=31))
-        with pytest.raises(ValueError, match="not supported"):
+        with pytest.raises(ValueError, match="Unsupported task"):
             await drift_connector.analyze_data_drift("MetalSeg", "1.0", START, END, task="seg")
-        with pytest.raises(ValueError, match="Unknown bucket"):
+        with pytest.raises(ValueError, match="Unsupported bucket"):
             await drift_connector.analyze_data_drift("MetalCls", "1.0", START, END, bucket="2d")
-        with pytest.raises(ValueError, match="Unknown detail"):
+        with pytest.raises(ValueError, match="Unsupported detail"):
             await drift_connector.analyze_data_drift("MetalCls", "1.0", START, END, detail="tiny")
 
         drift_connector._mock_db[DBCollections.INSPECTIONS].count_documents.assert_not_awaited()

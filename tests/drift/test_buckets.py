@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 
 from common.config import SETTINGS
-from common.constants import BucketSize, DriftWindow
+from common.constants import BucketSize, DriftWindowMode
 from mongodb_mcp.drift import RecordExtractor
 from mongodb_mcp.drift.buckets import BucketBuilder
 from tests.drift.synthetic import generate_rows, cls_prediction, det_prediction
@@ -14,7 +14,7 @@ def records_for(days: int, per_day: int, task: str = "cls"):
         rows = generate_rows(task, days, per_day, lambda rng, day: cls_prediction(rng, 0.9, 0.02))
     extractor = RecordExtractor()
     for row in rows:
-        extractor.add(row)
+        extractor.add_record(row)
     return extractor.records
 
 
@@ -48,12 +48,12 @@ class TestBoundaries:
 class TestBuildAndChoose:
     def test_build_buckets_by_utc_day(self):
         records = records_for(days=2, per_day=24)
-        buckets = BucketBuilder("cls").build(records, BucketSize.DAY, DriftWindow.REFERENCE)
+        buckets = BucketBuilder("cls").build(records, BucketSize.DAY, DriftWindowMode.REFERENCE)
 
         assert len(buckets) == 2
         assert sum(bucket.record_count for bucket in buckets) == len(records)
         assert [bucket.start_date for bucket in buckets] == sorted(bucket.start_date for bucket in buckets)
-        assert all(bucket.window == DriftWindow.REFERENCE and bucket.merged_from == 1 for bucket in buckets)
+        assert all(bucket.window == DriftWindowMode.REFERENCE and bucket.merged_from == 1 for bucket in buckets)
         assert buckets[0].end_date == buckets[1].start_date
 
     def test_build_empty(self):
@@ -62,7 +62,6 @@ class TestBuildAndChoose:
     def test_auto_short_range_is_hourly(self):
         builder = BucketBuilder("cls")
         assert builder.choose(records_for(days=1, per_day=24 * 250), 1.0) == BucketSize.HOUR
-        assert builder.warnings == []
 
     def test_auto_two_weeks_is_daily(self):
         assert BucketBuilder("cls").choose(records_for(days=14, per_day=300), 14.0) == BucketSize.DAY
@@ -79,13 +78,10 @@ class TestBuildAndChoose:
         mocker.patch.object(builder, "config", SETTINGS.data_drift.model_copy(update={"max_buckets": 10}))
 
         assert builder.choose(records_for(days=14, per_day=300), 14.0, requested="1h") == BucketSize.WEEK
-        assert len(builder.warnings) == 2
-        assert all("coarsened" in message for message in builder.warnings)
 
     def test_explicit_bucket_is_kept(self):
         builder = BucketBuilder("cls")
         assert builder.choose(records_for(days=3, per_day=10), 3.0, requested="1d") == BucketSize.DAY
-        assert builder.warnings == []
 
 
 class TestMerge:

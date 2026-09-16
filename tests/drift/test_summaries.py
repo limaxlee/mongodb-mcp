@@ -17,7 +17,7 @@ def records_for(task: str, days: int = 2, per_day: int = 100, **kwargs):
         rows = generate_rows(task, days, per_day, lambda rng, day: cls_prediction(rng, 0.9, 0.3, **kwargs))
     extractor = RecordExtractor()
     for row in rows:
-        extractor.add(row)
+        extractor.add_record(row)
     return extractor.records
 
 
@@ -95,8 +95,6 @@ class TestSummaries:
         assert set(summary["confidence_quantiles"]) == {"p05", "p10", "p25", "p50", "p75", "p90", "p95"}
         assert summary["threshold_values"] == [0.8]
         assert summary["image_specs"] == [[400, 400, 3]]
-        assert summary["median_patch_width"] == 66.0 and summary["median_patch_height"] == 40.0
-        assert summary["decision_differs_rate"] == 0.0
         assert "box" not in summary and "mean_boxes_per_image" not in summary
 
     def test_bucket_summary_detection(self):
@@ -126,7 +124,9 @@ class TestSummaries:
 
     def test_empty_bucket_summary(self):
         prediction = det_prediction(random.Random(1), 0.9, 0.0, no_box_rate=1.0)
-        records = [RecordExtractor().add(make_row(1, START, "det", prediction))]
+        extractor = RecordExtractor()
+        extractor.add_record(make_row(1, START, "det", prediction))
+        records = extractor.records
         bucket = BucketBuilder("det").build(records, BucketSize.DAY)[0]
         summary = Summarizer("det", ["Good", "NG"]).bucket(bucket)
         assert summary["median_confidence"] is None and summary["confidence_quantiles"] == {}

@@ -1,8 +1,8 @@
 # Data Drift Analysis
 
 This document describes the `mongodb_analyze_data_drift` MCP tool as implemented in this repository: why it exists,
-where the code lives, how a call flows through it, which statistical techniques it uses and why, every configuration
-value, and every field of the result with the way it is meant to be read.
+where the code lives, how a call flows through it, how every step works and why it was built that way, every
+configuration value, and every field of the result with the way it is meant to be read.
 
 ---
 
@@ -36,28 +36,29 @@ which carries nothing the tool can compare.
 
 ```
 common/constants.py                  every drift enum and constant: DriftTask, BucketSize, DriftDetail, DriftMode,
-                                     DriftWindow, DriftFlag, PreVerdict, FLAG_VERDICT, TrendSeries, OutlierSeries,
-                                     TrendFamily, TREND_FLAG_FAMILY, SeriesKind, HardBreakKind, BoxGeometry,
-                                     AUTO_BUCKET, CLASS_SHARE_PREFIX
+                                     DriftWindowMode, DriftFlag, PreVerdict, FLAG_VERDICT, TrendSeries,
+                                     OutlierSeries, TrendFamily, TREND_FLAG_FAMILY, SeriesKind, HardBreakKind,
+                                     BoxGeometry, AUTO_BUCKET, CLASS_SHARE_PREFIX
 common/config.py                     DataDriftConfig: every threshold and minimum, filled from the data_drift
                                      section of config.yaml, reachable as SETTINGS.data_drift
 config.yaml                          the data_drift section with the values used in production
 
-mongodb_mcp/drift/                   the analysis, one class per module, pure Python, synchronous
-  drift.py         DriftAnalyzer     orchestration, hard breaks, pairwise maximum, result assembly
-  query.py         DriftQuery        match() document filter and pipeline() flattening aggregation
-  extractor.py     RecordExtractor   flattened rows -> Record / BoxRecord, data quality counters, task resolution
+mongodb_mcp/drift/                   the analysis, one class per module, plain Python, synchronous
+  window.py        DriftWindow       the analysed windows: UTC normalisation, validation, date ranges, total days
+  query.py         DriftQueryBuilder build() document filter and build_pipeline() flattening aggregation
+  extractor.py     RecordExtractor   flattened rows -> Record / BoxRecord, data quality counters
   buckets.py       BucketBuilder     bucket boundaries, automatic size choice, bucket cap, small bucket merging
   summaries.py     Summarizer        per bucket and per side statistics, additive side counts, series access
   splits.py        SplitFinder       before/after divergence, best split search, secondary splits
   series.py        SeriesAnalyzer    trends and outlier buckets over the scalar bucket series
   rules.py         DriftRules        statistics -> flags, flags -> pre-verdict
+  drift.py         DriftAnalyzer     orchestration, hard breaks, pairwise maximum, result assembly
 
 mongodb_mcp/utils/stats.py           PSI, Jensen-Shannon, KS, chi-square, Kendall tau, Theil-Sen, robust z,
                                      quantiles, histograms; plain functions over plain sequences
-mongodb_mcp/utils/db_helpers.py      to_utc()
-mongodb_mcp/schemas/drift.py         pydantic models: the internal Record, BoxRecord, Bucket, SideCounts and
-                                     DriftWindows, and the result DriftAnalysisResult with all its parts
+mongodb_mcp/utils/datetime.py        to_utc(), convert_to_utc_datetime(), get_elapsed_days()
+mongodb_mcp/schemas/drift.py         pydantic models: the internal Record, BoxRecord, Bucket, SideCounts, and the
+                                     result DriftAnalysisResult with all its parts
 mongodb_mcp/connector/connector.py   MongoDBConnector.analyze_data_drift(): validates, streams rows, runs the analysis
 mongodb_mcp/tools/tools.py           the MCP tool mongodb_analyze_data_drift
 tests/drift/                         synthetic row generator and one test module per drift module
@@ -78,8 +79,8 @@ Registered name on the server: `mcp_mongodb_analyze_data_drift` (the tools serve
 |---|---|---|---|
 | `model_name` | str | required | Model name, e.g. `MetalDet`; matched exactly together with the version as `name/version` |
 | `model_version` | str | required | Model version, e.g. `1.0` |
-| `start_date` | datetime | required | Start of the analysed (current) window, inclusive, UTC |
-| `end_date` | datetime | required | End of the current window, exclusive |
+| `start_date` | datetime | required | Start of the analysed (current) window, UTC |
+| `end_date` | datetime | required | End of the current window |
 | `task` | `cls` / `det` / null | null | Only needed when the same model string is used for both tasks |
 | `gbm`, `process`, `location`, `equipment_id` | str / null | null | Exact-match filters on `metadata.*` |
 | `mode` | str / null | `production` | Operating mode. Pass `null` explicitly to include rework and test data |
@@ -95,7 +96,8 @@ Two modes exist:
   at the fixed boundary between them instead of searching for a split.
 
 The windows together may cover at most `max_total_days` (30). The reference window must end before the current one
-starts. All dates are UTC, naive datetimes are treated as UTC, which is how MongoDB stores them.
+starts. All dates are UTC, naive datetimes are treated as UTC, which is how MongoDB stores them. Both boundaries of a
+window are inclusive in the query (`$gte` start, `$lte` end).
 
 **When a model runs on several cameras, pass `equipment_id`.** Hard breaks (section 6.7) compare consecutive records,
 and two cameras with different image sizes interleaved in time look like a camera that keeps changing.
@@ -107,11 +109,13 @@ and two cameras with different image sizes interleaved in time look like a camer
 ```
 tool argument validation (fastmcp)
   -> MongoDBConnector.analyze_data_drift
-       DriftWindows            validates and UTC-normalises the windows
-       DriftQuery              match() + pipeline() per window
+       argument checks         task, bucket and detail must be supported values, the collection must exist
+       DriftWindow             UTC-normalises the dates, validate() checks order and total length
+       DriftQueryBuilder       build() + build_pipeline(), once per window
        RecordExtractor         one instance, rows of the reference window first, then the current window
+       no records at all       ValueError "No inspection results found ..."
        DriftAnalyzer.run()     in a thread so the server stays responsive
-            BucketBuilder      choose the bucket size on both windows, build and merge per window
+            BucketBuilder      choose the bucket size on all records, build and merge per window
             Summarizer         one summary per bucket
             SeriesAnalyzer     trends and outliers over the summaries
             SplitFinder        change point (range mode, isolated outliers left aside) or fixed comparison
@@ -127,25 +131,45 @@ Every class reads `SETTINGS.data_drift` once when it is created. `Summarizer` ho
 
 ## 5. Step by step
 
-### 5.1 Query and flattening (`DriftQuery`)
+### 5.1 Windows (`DriftWindow`)
 
-`match()` produces the document-level filter:
+A plain class holding the four dates. The constructor converts each one to UTC (a naive datetime is stamped as UTC,
+an aware one is converted). The connector then calls `validate()`, which raises a `ValueError` when:
+
+- the start date is not before the end date,
+- only one of the two reference dates is given,
+- the reference start is not before the reference end,
+- the reference window ends after the current window starts,
+- the two windows together cover more than `max_total_days`.
+
+The class also exposes `comparison` (true when a reference window exists), `current` and `reference` as `DateRange`
+values (start, end, length in days) that go straight into the result, and `total_days`, which the bucket chooser
+uses.
+
+*Why a plain class and not a pydantic model:* the object is built exactly once from already typed arguments, never
+parsed from JSON, and never serialised. Validation on construction would hide the check inside a framework hook; an
+explicit `validate()` call in the connector makes the order of checks visible where the request is handled.
+
+### 5.2 Query and flattening (`DriftQueryBuilder`)
+
+`build()` produces the document-level filter:
 
 ```javascript
 {
   isDeleted: false,
-  "metadata.createdAt": { $gte: start_date, $lt: end_date },
-  "inspectionResult.aiResults": { $elemMatch: { aiModel: "MetalDet/1.0", task: "det" } },   // task only when given
+  "metadata.createdAt": { $gte: start_date, $lte: end_date },
+  "inspectionResult.aiResults": { $elemMatch: { aiModel: "MetalDet/1.0", task: "det" } },   // task: $in [cls, det] when not given
   "metadata.gbm": ..., "metadata.equipmentId": ...                                            // only the given filters
 }
 ```
 
-`pipeline()` turns the matching documents into **one row per prediction of the analysed model**: match, sort by
+`build_pipeline()` turns the matching documents into **one row per prediction of the analysed model**: match, sort by
 `metadata.createdAt` (before any unwind so the index carries the sort), project the needed fields, unwind
-`aiResults` keeping the entry index, keep only entries of the model, unwind `predictions`, project a flat row, and
-drop feedback arrays. Detections stay nested inside their prediction so an image row arrives together with its boxes.
+`aiResults` keeping the entry index, keep only entries of the model (and task, when given), unwind `predictions`,
+project a flat row, and drop feedback arrays. Detections stay nested inside their prediction so an image row arrives
+together with its boxes.
 
-The connector runs `count_documents(match)` for `scannedDocumentCount`, then iterates the aggregation cursor with
+The connector runs `count_documents(filter)` for `scannedDocumentCount`, then iterates the aggregation cursor with
 `allowDiskUse=True` and feeds every row into the extractor. Rows are never loaded into a list; only the extracted
 records are kept in memory.
 
@@ -155,68 +179,137 @@ Create this index once on the `inspections` collection so both the sort and the 
 db.inspections.createIndex({ "metadata.createdAt": 1, "inspectionResult.aiResults.aiModel": 1 })
 ```
 
-### 5.2 Extraction (`RecordExtractor`)
+### 5.3 Extraction (`RecordExtractor`)
 
-`add(row, window)` turns a row into a `Record` tagged with its window (`current` or `reference`). It **never raises
-on a malformed row**: the row is counted in `parseErrorCount` (with up to `max_parse_error_examples` ids) and
-skipped. The only exception that propagates is `UnsupportedTaskError` for a segmentation entry, because that is a
-caller mistake, not bad data.
+`add_record(row, window)` turns a row into a `Record` tagged with its window (`current` or `reference`). A row whose
+`task` differs from the requested one is ignored. When no task was requested, the first row's task becomes the task
+of the analysis. The extractor **never raises on a malformed row**: any exception during extraction is caught, the
+row is counted in `parseErrorCount` (with up to `max_parse_error_examples` ids), logged, and skipped.
 
 | Record field | Source | Notes |
 |---|---|---|
 | `inspection_id`, `prediction_id` | `_id`, `prediction.predictionId` | traceability |
 | `created_at` | `metadata.createdAt` | UTC |
 | `gbm, process, location, equipment_id, product_id, mode, backend, classes` | metadata / entry | kept for hard break scanning and investigation |
-| `threshold` | `prediction.threshold` (cls); first box threshold (det, unused, thresholds are read per box) | may be null |
-| `elapsed_time`, `is_patch`, `patch_width`, `patch_height` | prediction, `patchSpec` | patch size only when `isPatch` |
+| `threshold` | `prediction.threshold` (cls); the prediction threshold or else the first box threshold (det) | may be null |
+| `elapsed_time` | `prediction.elapsedTime` | inference time |
 | `image_width`, `image_height`, `image_channels` | `dataSpec[fileIndex]` | null and counted in `missingImageSpecCount` when the index is out of range or the keys are missing |
 
 **Confidence normalisation.** A list of confidences collapses to its **maximum** (`max_confidence`); the other
-entries are ignored. A scalar is used as is. An empty list, a missing or non-numeric value gives null and is counted
-in `missingConfidenceCount`. Derived per classification record: `below_threshold = max_confidence < threshold`,
-`near_threshold = |max_confidence - threshold| < near_threshold_margin`, `decision_differs = decision != prediction`.
+entries are ignored. A scalar is used as is. An empty list, a missing or a non-numeric value gives null and is
+counted in `missingConfidenceCount`; the record is kept and simply contributes nothing to the confidence statistics.
+Derived per classification record, when both a threshold and a confidence exist:
+`below_threshold = max_confidence < threshold`, `near_threshold = |max_confidence - threshold| < near_threshold_margin`.
+The `decision` field of a prediction is not read: it carries nothing about the input distribution.
 
 **Detection boxes.** Each box becomes a `BoxRecord` with `prediction`, `max_confidence`, `threshold`,
 `below_threshold`, the raw geometry `x1 y1 x2 y2 width height area aspect cx cy`, and the normalised geometry
 `normalized_width normalized_height normalized_area normalized_cx normalized_cy` divided by the image size.
 Normalised geometry exists so that a camera resolution change does not look like a box size change; it is null when
-the image size is unknown. Per image the record keeps `box_count`, `box_count_by_class`, `below_threshold_count`,
-`mean_confidence`, `min_confidence`. A box with a malformed `bbox` is skipped and counted as a parse error.
+the image size is unknown. A box without a confidence is counted in `missingConfidenceCount`. Per image the record
+keeps `box_count`, `box_count_by_class`, `below_threshold_count`, `mean_confidence`, `min_confidence`. A box with a
+malformed `bbox` is skipped and counted as a parse error.
 
-**Bookkeeping.** The extractor tracks the set of tasks seen, the ordered union of `classes` across entries, the
-matched document and entry ids, and one-time warnings for an unknown `schemaVersion` or a prediction class that is
-not in `classes`. `resolve_task()` returns the requested task or the single task seen; if the model string was used
-for both `cls` and `det` the tool raises `"The model has multiple tasks [...], specify task"`. With no rows at all
-the tool still returns a result (`undetermined`, with a warning) rather than failing.
-
-### 5.3 Windows (`DriftWindows`)
-
-A pydantic model validates the request before any query runs: UTC normalisation, `start_date < end_date`, reference
-dates given together, reference before current, and the total length under `max_total_days`. It also exposes the
-two `DateRange` values and the flag `comparison`.
+**Bookkeeping.** The extractor tracks the ordered union of `classes` across entries and the matched document and
+entry ids. Every prediction is identified by document id, entry index and prediction id, and a prediction seen a
+second time is ignored. Both window bounds are inclusive, so a document stamped exactly on the boundary between the
+reference and the current window is returned by both queries; the copy from the reference window, extracted first,
+is the one that counts. When neither window produced a single record, the connector raises
+`"No inspection results found for model ... in the requested time window"` instead of returning an empty result.
 
 ### 5.4 Bucketing (`BucketBuilder`)
 
 Statistics are computed per time bucket so the result is a *series* and the reader can see *when* something changed.
 Buckets are cut on UTC boundaries: top of the hour (`1h`), midnight (`1d`), Monday midnight (`1w`).
 
-**Automatic choice** (`bucket="auto"`), with `MIN_N` = `min_bucket_records_cls` (200) or `min_bucket_records_det`
-(100):
+**A bucket exists only where records exist.** `build()` groups records by the floor of their timestamp; a day without
+inspections produces no bucket at all. Daily buckets over a month of sparse production are therefore not contiguous,
+and the number of buckets is the number of distinct periods with data, not the number of periods in the window.
 
-1. Start with `1d`; use `1h` if the total range is at most 2 days, `1w` if over 60 days (unreachable under the cap).
-2. Build the buckets. If more than `small_bucket_share` (30 %) of them hold fewer than `MIN_N` records, coarsen one
-   step (`1h -> 1d -> 1w`) and repeat.
-3. Whatever was chosen, coarsen further while the bucket count exceeds `max_buckets` (60), adding a warning each time.
-4. Merge every remaining bucket with fewer than `MIN_N` records into its next neighbour (previous one for the last
-   bucket). Merged buckets are listed in `dataQuality.mergedBuckets` and the surviving bucket's `mergedFrom` counts
-   how many raw buckets it absorbed.
+#### 5.4.1 Why a minimum bucket size
 
-In comparison mode the bucket size is chosen once on both windows together, then each window is bucketed and merged
-separately so that a merge never crosses the gap between them. The reference buckets come first in the sequence.
+Every bucket becomes a set of statistics: class shares, a confidence histogram, quantiles. The change point search
+and the outlier detection compare those statistics bucket to bucket with PSI and chi-square. On a bucket with 30
+records those numbers are mostly sampling noise: a class share of 0.40 versus 0.55 between two such buckets is
+normal variation, not drift, yet it would score as a large move and could pull the change point next to it. Every
+bucket must therefore hold at least `MIN_N` records, `min_bucket_records_cls` (200) for classification or
+`min_bucket_records_det` (100) for detection. Two mechanisms enforce it: the automatic size choice tries to pick a
+grid where buckets are naturally large enough, and the merge folds the leftovers into a neighbour.
+
+#### 5.4.2 Automatic bucket size (`bucket="auto"`)
+
+`choose()` is a guess-and-check in three steps:
+
+1. **Initial guess from the window length.** Total analysed days (current plus reference) picks the start:
+   `1h` when the total is at most 2 days, `1w` when it is over 60 days, `1d` otherwise. With `max_total_days` at 30
+   the weekly branch is unreachable, so auto effectively starts hourly for a short window and daily for everything
+   else.
+2. **Coarsen while too many buckets are thin.** Build raw buckets at that size over all records and count how many
+   hold fewer than `MIN_N`. If more than `small_bucket_share` (30 %) of them are small, move one step coarser
+   (`1h -> 1d -> 1w`) and try again. The ladder stops at `1w`.
+3. **Hard cap, in auto and explicit mode alike.** While the chosen size would produce more than `max_buckets` (60)
+   buckets, coarsen once more. With a 30 day maximum this only bites for hourly buckets over more than two and a half
+   days.
+
+*Why not always the finest grid:* finer buckets locate a change more precisely, but only if each bucket is big
+enough to trust. If a third of the buckets would be merged away anyway, the resolution is too fine for the data
+volume; a coarser grid gives fewer, more honest points. *Why the share is counted over buckets, not records:* it is a
+cheap rule that is easy to reason about. Its known weakness is that two nearly empty days out of five trigger
+coarsening even though they carry almost none of the records.
+
+An explicit `bucket` skips steps 1 and 2; only the cap applies.
+
+#### 5.4.3 Merging small buckets (`merge_small`)
+
+After the size is chosen, the raw buckets of one window are built and every bucket under `MIN_N` is folded into a
+neighbour:
+
+- The merger walks the list left to right. A small bucket is merged **forward** into the next bucket, which takes
+  over the small bucket's start date.
+- If the small bucket is the **last** one, there is no next bucket, so it is merged **backward** into the previous
+  one, which extends its end date.
+- The absorbing bucket's `mergedFrom` grows by the absorbed bucket's `mergedFrom`, so it counts raw buckets, not merge
+  operations. The start dates of every absorbed raw bucket are listed in `dataQuality.mergedBuckets`.
+- Merging happens **per window**. In comparison mode the reference buckets and the current buckets are merged
+  separately, so a merge never crosses the boundary between the two windows.
+
+Merging is repeated until every bucket in the window holds at least `MIN_N` records or only one bucket is left.
+Because a merged bucket can itself still be small, a run of thin buckets collapses into one.
+
+*Why forward rather than into the larger neighbour:* a rule that always merges in one direction is deterministic and
+keeps the chronological order trivially intact. Merging into whichever neighbour is larger would make the resulting
+bucket boundaries depend on volumes, so the same window could be cut differently after a few more records arrive.
+The single exception for the last bucket exists only because there is nothing after it.
+
+*Why merging instead of dropping:* the records of a thin bucket are real traffic. Dropping them would make
+`recordCount` disagree with what was scanned and would silently delete the very periods where something may have
+gone wrong (a line that produced little because it was stopping for a problem).
+
+*What to watch for:* a merged bucket's date span covers the whole distance between the first and the last absorbed
+bucket, including any empty days in between. A daily bucket that reads `2026-07-16` to `2026-07-25` with
+`mergedFrom = 2` holds two days of data with a week-long gap, not nine days. `mergedFrom` is the only hint.
+
+#### 5.4.4 Worked example
+
+A classification model, 30 day range, `bucket="1d"`, `MIN_N = 200`. Only five days carry inspections:
+
+| Raw daily bucket | Records | Fate |
+|---|---|---|
+| 07-15 | 1094 | kept as is |
+| 07-16 | under 200 | merged forward into 07-24 |
+| 07-24 | the rest of 1867 | absorbed 07-16, now spans 07-16 to 07-25, `mergedFrom = 2` |
+| 07-29 | the rest of 2029 | absorbed 07-31, now spans 07-29 to 08-01, `mergedFrom = 2` |
+| 07-31 | under 200 | last bucket, merged backward into 07-29 |
+
+Three buckets remain, `mergedBuckets = [07-16, 07-31]`, and because the change point needs four buckets the result
+carries `INSUFFICIENT_BUCKETS` and an `undetermined` verdict. With `bucket="auto"` the same data would have moved to
+weekly buckets (two of five raw buckets are small, 40 % is above the 30 % share), landing in three calendar weeks
+with no merge needed, and still three buckets. The real problem in such a case is sparsity, not bucketing; a
+comparison against an earlier reference window is the mode that can still produce a verdict.
 
 ### 5.5 Summaries (`Summarizer`)
 
-Every bucket gets the same summary (section 8.5). **Convention for detection:** an image row has no confidence of
+Every bucket gets the same summary (section 8.4). **Convention for detection:** an image row has no confidence of
 its own, so for `det` the confidence statistics, the class distribution and the threshold statistics of a bucket are
 computed **over the boxes** in that bucket. The `box` block then carries only geometry. `recordCount` is the number
 of images and `boxCount` the number of boxes.
@@ -231,45 +324,72 @@ The quantile points come from the schema itself: `ConfidenceQuantiles` has the f
 
 ### 5.6 Series analysis (`SeriesAnalyzer`)
 
-Runs before the split search so that the split can leave transients aside.
+Runs before the split search so that the split can leave transients aside. Both analyses need at least
+`min_buckets_trend` (6) buckets with a value for the series; below that nothing is computed and `status.trendRan`
+is false.
 
 **Trends.** For every series in `TrendSeries` (`median_confidence, mean_confidence, below_threshold_rate,
 mean_boxes_per_image, no_box_rate, median_normalized_area, median_normalized_cx, median_normalized_cy`) plus one
-`class_share_<class>` series per class, with at least `min_buckets_trend` (6) non-null bucket values: Kendall tau and
-its p-value against the bucket index, Theil-Sen slope per bucket, first and last value. A trend is `meaningful` when
-`p < trend_p`, `|tau| >= trend_tau`, and the move from first to last is practically relevant (section 6.6).
+`class_share_<class>` series per class: Kendall tau and its p-value against the bucket index, Theil-Sen slope per
+bucket, first and last value. A trend is `meaningful` when `p < trend_p`, `|tau| >= trend_tau`, and the move from
+first to last is practically relevant (section 6.6).
 
 **Outliers.** For every series in `OutlierSeries` (`median_confidence, below_threshold_rate, mean_boxes_per_image,
 no_box_rate`) plus the class shares, every bucket gets a leave-one-out robust z-score. It is an outlier when
 `|z| > robust_z` (3.5) **and** the move against the median of the other buckets is practically relevant (for rates
 both the absolute and the relative threshold must hold).
 
-### 5.7 Split analysis (`SplitFinder`)
+### 5.7 Change point and comparison (`SplitFinder`)
 
-**Range mode.** The buckets flagged as *isolated* outliers (no flagged neighbour) are left out of the search: a
-single anomalous bucket would otherwise pull the best split next to itself and read as a persistent shift. A run of
-flagged neighbours is a level change, not a transient, and stays in. Over the remaining buckets:
+The question a change point answers is: *if the range were cut into a before and an after, where would the cut be so
+that the two sides differ the most?*
+
+**Range mode, step 1: leave isolated outliers aside.** A bucket flagged as an outlier whose neighbours are not
+flagged is removed from the search. A single anomalous bucket would otherwise pull the best split next to itself and
+read as a persistent shift, when it is really a one-day event. Two or more flagged neighbours in a row are a level
+change, not a transient, so they stay in. The removed buckets are still reported in `buckets` and `outlierBuckets`.
+
+**Step 2: score every cut.** Over the remaining `K` buckets, every position with at least `min_segment_buckets` (2)
+buckets on each side is a candidate, so there are `K - 3` candidates:
 
 ```
-for k in [min_segment_buckets, K - min_segment_buckets]:          # at least 2 buckets on each side
-    before = buckets[:k], after = buckets[k:]                      # count arrays via prefix sums
+for k in [2, K - 2]:
+    before = buckets[:k], after = buckets[k:]                      # count arrays via prefix sums, exact and cheap
     score_k = PSI(confidence_hist) + PSI(class_dist) + (det) PSI(boxes_per_image_hist)
-best = argmax score_k among splits where both sides are sufficient
-       (min_side_records: 500 cls records / 300 det images, and min_side_boxes: 300 boxes for det)
 ```
 
-If no split has enough records on both sides, the best split among all of them is still reported with
-`sidesSufficient=false`, so the reader sees where the largest movement is, but the shift flags stay silent and
-`INSUFFICIENT_DATA` is raised. The reported `bucketIndex` refers to the full bucket sequence.
+*Why PSI as the score:* it is the same quantity the flags read, so the split the search picks is the one the flags
+will judge. *Why a sum of several PSIs:* a covariate shift moves the confidence histogram, a label shift moves the
+class distribution, and a detector losing objects moves the boxes-per-image histogram; summing them lets the search
+find whichever kind of change is largest without knowing in advance which one to look for.
 
-For the winning split the full report is computed **from the records of the two sides** (section 8.6). After the
-primary split, the same search runs once on each side that still holds at least `2 * min_segment_buckets` buckets;
-a secondary split is reported only when its sides are sufficient.
+**Step 3: prefer a cut with enough data on both sides.** The best score among cuts where both sides are
+*sufficient* wins: `min_side_records_cls` (500) records or `min_side_records_det` (300) images on each side, plus
+`min_side_boxes` (300) boxes per side for detection. If no cut is sufficient, the best cut overall is still reported
+with `sidesSufficient = false`, so the reader sees where the largest movement is, but no shift flag fires and
+`INSUFFICIENT_DATA` is raised instead. `bucketIndex` refers to the full bucket sequence, including the buckets that
+were left aside.
+
+*Why an explicit sufficiency rule:* PSI, chi-square and KS all become more excitable as samples shrink. Reporting a
+divergence value computed on 80 records as if it were as trustworthy as one on 8000 would mislead the reader; the
+flag stays silent and the number is marked as indicative.
+
+**Step 4: the full report.** For the winning cut the complete comparison (section 8.5) is computed from the records
+of the two sides: PSI, Jensen-Shannon and KS on the confidences, PSI and chi-square on the classes, the largest
+change of any class share, and for detection PSI on boxes per image and KS on the normalised geometry. The p-values
+of the tests are multiplied by `candidateCount` (section 6.9). Both sides' summaries are attached so the direction of
+the move is visible.
+
+**Step 5: secondary cuts.** The same search runs once on each side of the primary cut that still holds at least
+`2 * min_segment_buckets` buckets. A secondary cut is reported only when its sides are sufficient. This is one level
+of binary segmentation: enough to reveal a second event in the range without turning the result into a list of
+every wobble.
 
 **Comparison mode.** The search is skipped. The reference records are the `before` side, the current records the
-`after` side, and `comparison` carries exactly the fields of a change point with `bucketIndex` null, `date` = start
-of the current window and `candidateCount` 1. Trend and outlier detection run over the combined chronological bucket
-sequence; Kendall tau is rank based, so the gap between the windows does not invalidate it.
+`after` side, and `comparison` carries exactly the fields of a change point with `bucketIndex` null, `date` equal to
+the start of the current window and `candidateCount` 1 (no correction needed, the cut was not chosen by the data).
+Trend and outlier detection still run over the combined chronological bucket sequence; Kendall tau is rank based, so
+the gap between the windows does not invalidate it.
 
 ### 5.8 Hard breaks and pairwise maximum (`DriftAnalyzer`)
 
@@ -279,7 +399,7 @@ or less than `elapsed_ratio_low` (0.67x) the median before, an `elapsed_time` br
 
 `maxPairwise` holds the largest PSI between any two buckets for the confidence histogram and for the class
 distribution, with the pair of bucket start dates. It shows the worst disagreement in the range even when no clean
-split exists.
+split exists, for example two short episodes that cancel out in a before/after view.
 
 ### 5.9 Rules (`DriftRules`)
 
@@ -307,13 +427,15 @@ with one from today. Counts, unlike proportions, add up, so any group of buckets
 PSI(p, q) = sum_i (q_i - p_i) * ln(q_i / p_i)        zeros replaced by eps = 1e-4, then renormalised
 ```
 
-*What it measures:* how much a distribution over fixed bins moved, symmetric, unbounded, 0 for identical
-distributions. *Why:* it is the industry standard for scoring stability of model inputs and outputs, has a widely
-used reading scale (`< 0.10` nothing, `0.10 - 0.25` moderate, `> 0.25` significant, the `psi_moderate` and
-`psi_significant` thresholds), and works directly on the additive counts. *Where:* confidence histogram, class
-distribution, boxes-per-image histogram, the split search score, the pairwise maximum. *Limits:* a bin that is empty
-on one side and populated on the other is punished hard because of the logarithm, which is why the split search
-leaves isolated outlier buckets aside; PSI has no p-value, it is a size, not a significance.
+*What it measures:* how much a distribution over fixed bins moved. It is symmetric, unbounded, and 0 for identical
+distributions. Each bin contributes according to both how much its share changed and by what ratio, so a bin that
+goes from 1 % to 5 % counts more than one going from 40 % to 44 %. *Why:* it is the industry standard for scoring
+stability of model inputs and outputs, has a widely used reading scale (`< 0.10` nothing, `0.10 - 0.25` moderate,
+`> 0.25` significant, the `psi_moderate` and `psi_significant` thresholds), and works directly on the additive
+counts. *Where:* confidence histogram, class distribution, boxes-per-image histogram, the split search score, the
+pairwise maximum. *Limits:* a bin that is empty on one side and populated on the other is punished hard because of
+the logarithm, which is why the split search leaves isolated outlier buckets aside and why empty bins are smoothed
+with `eps`. PSI has no p-value: it is a size, not a significance.
 
 ### 6.3 Jensen-Shannon divergence
 
@@ -363,6 +485,10 @@ to the uneven spacing that merged buckets or the gap between windows produce; a 
 | rate (`*_rate`) and class shares | suffix `_rate` or prefix `class_share_` | absolute `>= trend_rate_abs` (0.02) **or** relative `>= trend_rate_rel` (50 %) for trends, **and** for outliers |
 | count (`mean_boxes_per_image`) | the name | relative change `>= trend_count_rel` (20 %) |
 
+*Why a relevance test on top of significance:* with many records per bucket, a decline of 0.005 in median confidence
+can be statistically certain and operationally irrelevant. The relevance thresholds keep the flags about changes
+someone would act on.
+
 Note that a sharp step also produces a high `|tau|`, so a step change usually carries both a shift flag and trend
 flags. The pre-verdict counts trends per **family**, not per series (6.10).
 
@@ -401,8 +527,8 @@ the reading scale already carries the margin.
 
 Two design rules keep the verdict honest:
 
-- **Insufficiency is judged by what the analysis needed.** `INSUFFICIENT_DATA` fires when the window is below the
-  record minimum **or** when the primary split or comparison has `sidesSufficient=false` (records, and boxes for
+- **Insufficiency is judged by what the analysis needed.** `INSUFFICIENT_DATA` fires when the current window is below
+  the side minimum **or** when the primary split or comparison has `sidesSufficient=false` (records, and boxes for
   detection). `INSUFFICIENT_BUCKETS` fires below `min_buckets_changepoint` or when no split could be searched. The
   verdict is then `undetermined`, never a reassuring `stable` on data that was not tested.
 - **Trends are counted per family.** `median_confidence`, `mean_confidence` and `below_threshold_rate` are three
@@ -419,7 +545,7 @@ Every value below is a field of `DataDriftConfig` in `common/config.py`, filled 
 
 | Field | Default | Used by |
 |---|---|---|
-| `max_total_days` | 30 | `DriftWindows`: both windows together may not exceed it |
+| `max_total_days` | 30 | `DriftWindow`: both windows together may not exceed it |
 | `max_buckets` | 60 | `BucketBuilder`: coarsen while more buckets would result |
 | `min_bucket_records_cls` / `_det` | 200 / 100 | `BucketBuilder`: automatic size choice and small bucket merging |
 | `small_bucket_share` | 0.3 | `BucketBuilder`: share of small buckets that triggers coarsening |
@@ -484,11 +610,10 @@ Read this first. When `analysisPossible` is false the rest is descriptive only.
 | `boxCount` | boxes analysed, detection only |
 | `missingConfidenceCount`, `missingImageSpecCount` | predictions or boxes without a confidence, records without an image size |
 | `parseErrorCount`, `parseErrorExamples` | rows or boxes skipped as malformed, with example ids |
-| `mergedBuckets` | start dates of the raw buckets that were merged into a neighbour for being too small |
+| `mergedBuckets` | start dates of the raw buckets that were merged into a neighbour for being too small (section 5.4.3) |
 
 A large `parseErrorCount` or `missingConfidenceCount` relative to `recordCount` means the statistics describe a
-subset of the traffic. `classes` (every class the model output, in order of appearance) and `warnings` (non fatal
-problems met while extracting) sit next to it.
+subset of the traffic. `classes` (every class the model output, in order of appearance) sits next to it.
 
 ### 8.4 `buckets`: the chronological series
 
@@ -499,8 +624,8 @@ Compact block:
 
 | Field | Meaning |
 |---|---|
-| `startDate`, `endDate`, `window` | UTC boundaries; `current` or `reference` |
-| `recordCount`, `mergedFrom` | records in the bucket; raw buckets merged into it |
+| `startDate`, `endDate`, `window` | UTC boundaries; `current` or `reference`. After a merge the span covers every absorbed raw bucket, gaps included |
+| `recordCount`, `mergedFrom` | records in the bucket; raw buckets merged into it (1 when untouched) |
 | `classDistribution` | share of every class (every class present, 0.0 included); over boxes for detection |
 | `medianConfidence`, `meanConfidence` | over `max_confidence` |
 | `belowThresholdRate` | share of predictions (boxes) below their threshold, over those that have one; null if none has |
@@ -517,7 +642,6 @@ Full detail adds:
 | `thresholdValues` | distinct thresholds seen (should be one per class) |
 | `imageSpecs` | distinct `[width, height, channels]` seen (should be one) |
 | `medianElapsedTime` | median inference time |
-| `decisionDiffersRate`, `medianPatchWidth`, `medianPatchHeight` | classification only: share of records whose decision differs from the prediction; median crop size |
 | `boxCount`, `stdBoxesPerImage`, `boxesPerImageHistogram`, `boxesByClassPerImage` | detection only: box count, spread of boxes per image, proportions for 0, 1, 2, 3, 4, 5+ boxes, mean box count per class per image |
 | `box` | detection only: `boxCount`, `p10/p50/p90` of `normalizedArea`, `normalizedWidth`, `normalizedHeight`, `aspect`, `normalizedCx`, `normalizedCy`, and `normalizedAreaHistogram` over the fixed log10 bins |
 
@@ -554,7 +678,8 @@ that cancel out in a before/after view.
 One entry per tested series (`median_confidence`, `mean_confidence`, `below_threshold_rate`, `mean_boxes_per_image`,
 `no_box_rate`, `median_normalized_area`, `median_normalized_cx`, `median_normalized_cy`, and `class_share_<class>`
 per class), each with `tau`, `p`, `slopePerBucket`, `first`, `last`, `pointCount`, `meaningful`. Read `meaningful`
-first, then `first` and `last` for the size and direction, then `slopePerBucket` for the pace.
+first, then `first` and `last` for the size and direction, then `slopePerBucket` for the pace. Empty when fewer than
+`min_buckets_trend` buckets exist.
 
 ### 8.8 `outlierBuckets`
 
@@ -581,8 +706,8 @@ as a starting point and confirm or overrule it with the numbers above.
 
 | Flag | Condition |
 |---|---|
-| `INSUFFICIENT_DATA` | fewer than `min_side_records` records, or the primary split / comparison has `sidesSufficient=false` |
-| `INSUFFICIENT_BUCKETS` | fewer than `min_buckets_changepoint` buckets after merging, or no split could be searched (range mode) |
+| `INSUFFICIENT_DATA` | fewer than `min_side_records` records in the current window, or the primary split / comparison has `sidesSufficient=false` |
+| `INSUFFICIENT_BUCKETS` | fewer than `min_buckets_changepoint` buckets after merging, or no split could be searched (range mode only) |
 | `HARD_BREAK` | any hard break other than `elapsed_time` |
 | `CONFIDENCE_SHIFT` | `psiConfidence >= psi_significant` with both sides sufficient |
 | `CONFIDENCE_SHIFT_MODERATE` | `psi_moderate <= psiConfidence < psi_significant` |
@@ -612,20 +737,23 @@ Trend families: confidence (`median_confidence`, `mean_confidence`, `below_thres
 
 ## 10. Behaviour on edge cases
 
-- Model not found in the range: result with `analysisPossible=false`, `matchedDocumentCount=0`,
-  `INSUFFICIENT_DATA`, a warning, verdict `undetermined`.
+- Model not found in the windows: `ValueError` "No inspection results found ...", no result is produced.
+- Invalid windows, unsupported task, bucket or detail, missing collection: `ValueError` before any query runs.
 - Enough records overall but no split with enough records on each side: the best split is reported with
   `sidesSufficient=false`, `INSUFFICIENT_DATA`, verdict `undetermined`.
-- Fewer than 4 buckets: descriptive summary returned, `INSUFFICIENT_BUCKETS`, verdict `undetermined`.
+- Fewer than 4 buckets after merging: descriptive summary returned, `INSUFFICIENT_BUCKETS`, verdict `undetermined`.
+  Sparse production (few distinct days with data) is the usual cause, see section 5.4.4.
+- Fewer than 6 buckets: no trend and no outlier analysis, `trend` empty, `outlierBuckets` empty.
 - One anomalous bucket among normal ones: `TRANSIENT_OUTLIER` only, verdict `suspicious`; the change point is searched
   without that bucket.
 - Two or more consecutive anomalous buckets: treated as a level change and reported as a shift.
 - Camera resolution change with unchanged scene: `HARD_BREAK` on `image_spec`, no geometry flag, because geometry is
   normalised by the image size.
 - Per-class detection thresholds: no threshold break, because thresholds are tracked per class.
-- Same model string used for both tasks without `task`: `ValueError`, the caller must specify the task.
-- Segmentation model: `UnsupportedTaskError`.
-- Malformed rows: skipped and counted, never fatal.
+- Same model string used for both tasks without `task`: the first row's task is used and rows of the other task are
+  ignored. Pass `task` to make the choice explicit.
+- Malformed rows: skipped and counted, never fatal. A prediction without a usable confidence is not malformed: it is
+  kept with a null confidence and counted in `missingConfidenceCount`.
 
 Known limitations, deliberately left as they are:
 
@@ -634,6 +762,9 @@ Known limitations, deliberately left as they are:
 - The relevance thresholds of trends and outliers are fixed numbers, not scaled with the sample size of a bucket, so
   on low base rates (a below-threshold rate around 2 %) ordinary sampling noise can produce `TRANSIENT_OUTLIER` and a
   `suspicious` verdict. It never hides real drift.
+- The automatic bucket choice counts small buckets, not the records they hold, so a few nearly empty periods can push
+  the grid one step coarser than the bulk of the data would need.
+- A merged bucket's date span hides gaps between the absorbed periods; `mergedFrom` is the only indication.
 
 ---
 
@@ -662,12 +793,15 @@ need is already in the JSON. You confirm or overrule the `preVerdict` field and 
 ## How to read the result
 
 - `status` says what could be computed. If `analysisPossible` is false, or `flags` contain INSUFFICIENT_DATA or
-  INSUFFICIENT_BUCKETS, answer "undetermined" and explain what is missing (too few records, too short a range).
+  INSUFFICIENT_BUCKETS, answer "undetermined" and explain what is missing (too few records, too few periods with
+  data, too short a range).
 - `dataQuality` tells you how much data the numbers rest on. `recordCount` is the number of predictions (images for
   detection), `boxCount` the number of boxes. Mention any `parseErrorCount`, `missingConfidenceCount` or
-  `missingImageSpecCount` that is large relative to `recordCount`. Read `warnings`.
+  `missingImageSpecCount` that is large relative to `recordCount`. `mergedBuckets` lists periods that were too thin
+  to stand on their own and were folded into a neighbour.
 - `buckets` is the chronological series. Each bucket has `recordCount`; treat buckets with a small `recordCount` as
-  unreliable. In comparison mode `window` tells you whether a bucket belongs to the reference or the current period.
+  unreliable. `mergedFrom` above 1 means the bucket spans several raw periods, possibly with gaps between them. In
+  comparison mode `window` tells you whether a bucket belongs to the reference or the current period.
 - `changePoint` (range mode) or `comparison` (comparison mode) is the main before/after evidence. `date` is where
   the "after" side starts. `sidesSufficient` must be true for the divergence values to be trusted. `before` and
   `after` contain the histograms and quantiles of each side so you can see the direction of a move.
@@ -705,11 +839,11 @@ For detection models the confidence, class and threshold statistics are computed
 | Both confidence and class distribution move together | Genuine drift or a new defect type. |
 | ksNormalizedArea, ksNormalizedCx or ksNormalizedCy large | Camera moved, zoom changed, fixture or part variant changed. Almost always a physical cause. |
 | boxesPerImageHistogram or noBoxRate moves | Detector missing objects (lighting, contamination) or seeing extra objects (debris, new part). |
-| medianPatchWidth or medianPatchHeight moves (classification) | The upstream detector changed its output, so the classifier receives different crops. |
 | hardBreaks non-empty | Configuration change. Confirm with the line owner first. |
 | One entry in outlierBuckets, no shift flag, no trend flag | Transient event (bad lot, a shift with a lamp off). Not drift, but worth logging. |
 | Meaningful trend, no shift flag | Gradual degradation (lens contamination, wear, slow process change). |
 | elapsed_time hard break together with an image_spec break | Resolution or preprocessing change. Infrastructure, not data. |
+| INSUFFICIENT_BUCKETS with a long range | Production ran on few distinct days. Suggest comparison mode against an earlier reference window. |
 
 A change point answers WHEN, PSI and KS answer HOW MUCH, the before and after histograms answer IN WHICH DIRECTION,
 the flags give a consistent first decision. A step change usually also produces TREND flags because a step is
@@ -780,9 +914,9 @@ regardless of the verdict.
 
 ## 12. Operations
 
-- The index from section 5.1 must exist on the inspections collection; the tool does not create it.
+- The index from section 5.2 must exist on the inspections collection; the tool does not create it.
 - The analysis runs in a thread via `run_in_executor`, so other tool calls are not blocked.
-- The connector logs the record count per window and the final record count, bucket count and pre-verdict per
-  call. Malformed rows are logged at debug level with their id.
+- The connector logs the record count per window and the final record count per call. Malformed rows are logged at
+  warning level with their id.
 - Every threshold is tunable in `config.yaml` without a code change, and every result carries the values it was
   produced with.

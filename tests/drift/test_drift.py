@@ -4,9 +4,9 @@ import pytest
 from datetime import timedelta, timezone
 
 from common.config import SETTINGS, DataDriftConfig
-from common.constants import DriftWindow, DriftFlag, PreVerdict, HardBreakKind
-from mongodb_mcp.drift import DriftAnalyzer, RecordExtractor
-from mongodb_mcp.schemas import DriftWindows, DriftAnalysisResult
+from common.constants import DriftWindowMode, DriftFlag, PreVerdict, HardBreakKind
+from mongodb_mcp.drift import DriftAnalyzer, DriftWindow, RecordExtractor
+from mongodb_mcp.schemas import DriftAnalysisResult
 from tests.drift.synthetic import generate_rows, make_row, cls_prediction, det_prediction, START
 
 DAYS = 14
@@ -17,17 +17,17 @@ FILTERS = {"gbm": "SEV", "process": None, "location": None, "equipment_id": None
 def extract(rows, task=None, reference_rows=None):
     extractor = RecordExtractor(task=task)
     for row in reference_rows or []:
-        extractor.add(row, DriftWindow.REFERENCE)
+        extractor.add_record(row, DriftWindowMode.REFERENCE)
     for row in rows:
-        extractor.add(row)
+        extractor.add_record(row)
     extractor.quality.scanned_document_count = len(rows) + len(reference_rows or [])
     return extractor
 
 
 def analyze(rows, task=None, days=DAYS, windows=None, **kwargs):
     extractor = extract(rows, task)
-    windows = windows or DriftWindows(start_date=START, end_date=START + timedelta(days=days))
-    return DriftAnalyzer("Metal", "1.0", extractor.resolve_task(task), extractor, windows, FILTERS, **kwargs).run()
+    windows = windows or DriftWindow(start_date=START, end_date=START + timedelta(days=days))
+    return DriftAnalyzer("Metal", "1.0", extractor.get_task() or task, extractor, windows, FILTERS, **kwargs).run()
 
 
 class TestScenarios:
@@ -235,11 +235,12 @@ class TestInsufficiency:
 class TestModesAndOutput:
     def test_comparison_mode(self):
         reference_rows = generate_rows(
-            "cls", 7, 400, lambda rng, day: cls_prediction(rng, 0.93, 0.2), start=START - timedelta(days=7)
+            "cls", 7, 400, lambda rng, day: cls_prediction(rng, 0.93, 0.2), start=START - timedelta(days=7),
+            first_index=100_000
         )
         current_rows = generate_rows("cls", 7, 400, lambda rng, day: cls_prediction(rng, 0.84, 0.2))
         extractor = extract(current_rows, reference_rows=reference_rows)
-        windows = DriftWindows(
+        windows = DriftWindow(
             start_date=START, end_date=START + timedelta(days=7),
             reference_start_date=START - timedelta(days=7), reference_end_date=START
         )
@@ -253,18 +254,19 @@ class TestModesAndOutput:
         assert result.comparison.before_count == len(reference_rows)
         assert result.comparison.after_count == len(current_rows)
         assert DriftFlag.CONFIDENCE_SHIFT in result.flags
-        assert [bucket.window for bucket in result.buckets] == [DriftWindow.REFERENCE] * 7 + [DriftWindow.CURRENT] * 7
+        assert [bucket.window for bucket in result.buckets] == [DriftWindowMode.REFERENCE] * 7 + [DriftWindowMode.CURRENT] * 7
         assert result.reference_range.days == 7.0 and result.reference_range.end_date == START
         assert result.data_quality.record_count == len(reference_rows) + len(current_rows)
         assert result.data_quality.scanned_document_count == len(reference_rows) + len(current_rows)
 
     def test_comparison_with_a_small_reference_is_undetermined(self):
         reference_rows = generate_rows(
-            "cls", 2, 100, lambda rng, day: cls_prediction(rng, 0.93, 0.2), start=START - timedelta(days=2)
+            "cls", 2, 100, lambda rng, day: cls_prediction(rng, 0.93, 0.2), start=START - timedelta(days=2),
+            first_index=100_000
         )
         current_rows = generate_rows("cls", 5, 300, lambda rng, day: cls_prediction(rng, 0.7, 0.5))
         extractor = extract(current_rows, reference_rows=reference_rows)
-        windows = DriftWindows(
+        windows = DriftWindow(
             start_date=START, end_date=START + timedelta(days=5),
             reference_start_date=START - timedelta(days=2), reference_end_date=START
         )
@@ -349,32 +351,32 @@ class TestModesAndOutput:
 
 class TestWindows:
     def test_validation(self):
-        with pytest.raises(ValueError, match="before end_date"):
-            DriftWindows(start_date=END, end_date=START)
-        with pytest.raises(ValueError, match="maximum is 30"):
-            DriftWindows(start_date=START, end_date=START + timedelta(days=31))
+        with pytest.raises(ValueError, match="before end date"):
+            DriftWindow(start_date=END, end_date=START).validate()
+        with pytest.raises(ValueError, match="max time window is 30"):
+            DriftWindow(start_date=START, end_date=START + timedelta(days=31)).validate()
         with pytest.raises(ValueError, match="given together"):
-            DriftWindows(start_date=START, end_date=END, reference_start_date=START - timedelta(days=7))
-        with pytest.raises(ValueError, match="before reference_end_date"):
-            DriftWindows(start_date=START, end_date=END, reference_start_date=START, reference_end_date=START)
-        with pytest.raises(ValueError, match="end before the current"):
-            DriftWindows(start_date=START, end_date=END, reference_start_date=START - timedelta(days=1),
-                         reference_end_date=START + timedelta(days=1))
-        with pytest.raises(ValueError, match="maximum is 30"):
-            DriftWindows(start_date=START, end_date=END, reference_start_date=START - timedelta(days=20),
-                         reference_end_date=START)
+            DriftWindow(start_date=START, end_date=END, reference_start_date=START - timedelta(days=7)).validate()
+        with pytest.raises(ValueError, match="before reference end date"):
+            DriftWindow(start_date=START, end_date=END, reference_start_date=START, reference_end_date=START).validate()
+        with pytest.raises(ValueError, match="end before current window"):
+            DriftWindow(start_date=START, end_date=END, reference_start_date=START - timedelta(days=1),
+                        reference_end_date=START + timedelta(days=1)).validate()
+        with pytest.raises(ValueError, match="max time window is 30"):
+            DriftWindow(start_date=START, end_date=END, reference_start_date=START - timedelta(days=20),
+                        reference_end_date=START).validate()
 
     def test_ranges(self):
-        windows = DriftWindows(start_date=START, end_date=END, reference_start_date=START - timedelta(days=14),
+        windows = DriftWindow(start_date=START, end_date=END, reference_start_date=START - timedelta(days=14),
                                reference_end_date=START)
         assert windows.comparison and windows.total_days == 28.0
         assert windows.current.start_date == START and windows.current.days == 14.0
         assert windows.reference.end_date == START and windows.reference.days == 14.0
 
-        windows = DriftWindows(start_date=START, end_date=END)
+        windows = DriftWindow(start_date=START, end_date=END)
         assert not windows.comparison and windows.reference is None and windows.total_days == 14.0
 
     def test_naive_dates_are_treated_as_utc(self):
-        windows = DriftWindows(start_date=START.replace(tzinfo=None), end_date=END.replace(tzinfo=None))
+        windows = DriftWindow(start_date=START.replace(tzinfo=None), end_date=END.replace(tzinfo=None))
         assert windows.start_date == START and windows.start_date.tzinfo == timezone.utc
         assert windows.end_date == END

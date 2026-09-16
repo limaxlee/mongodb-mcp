@@ -1,10 +1,10 @@
-"""Orchestrates the drift analysis over extracted records and assembles the result"""
 from typing import Any, Sequence
 
 from common.config import SETTINGS
-from common.constants import AUTO_BUCKET, DriftDetail, DriftMode, DriftWindow, HardBreakKind
+from common.constants import AUTO_BUCKET, DriftDetail, DriftMode, DriftWindowMode, HardBreakKind
 from mongodb_mcp.utils import stats
-from mongodb_mcp.schemas import Record, Bucket, DriftWindows, DriftAnalysisResult
+from mongodb_mcp.schemas import Record, Bucket, DriftAnalysisResult
+from mongodb_mcp.drift.window import DriftWindow
 from mongodb_mcp.drift.extractor import RecordExtractor
 from mongodb_mcp.drift.buckets import BucketBuilder
 from mongodb_mcp.drift.summaries import Summarizer
@@ -14,19 +14,13 @@ from mongodb_mcp.drift.rules import DriftRules
 
 
 class DriftAnalyzer:
-    """Runs every step of the analysis over the records of one extractor and assembles the result
-
-    Range mode searches the current window for the split with the largest divergence, comparison mode compares the
-    reference window against the current one at the fixed boundary between them.
-    """
-
     def __init__(
             self,
             model_name: str,
             model_version: str,
             task: str,
             extractor: RecordExtractor,
-            windows: DriftWindows,
+            windows: DriftWindow,
             filters: dict[str, str | None],
             bucket: str = AUTO_BUCKET,
             detail: str = DriftDetail.FULL
@@ -42,10 +36,10 @@ class DriftAnalyzer:
         self.detail = DriftDetail(detail)
 
         self.records = sorted(extractor.records, key=lambda item: item.created_at)
-        self.current = [record for record in self.records if record.window == DriftWindow.CURRENT]
-        self.reference = [record for record in self.records if record.window == DriftWindow.REFERENCE]
+        self.current = [record for record in self.records if record.window == DriftWindowMode.CURRENT]
+        self.reference = [record for record in self.records if record.window == DriftWindowMode.REFERENCE]
 
-        self.summarizer = Summarizer(task, extractor.classes_seen)
+        self.summarizer = Summarizer(task, extractor.classes)
         self.builder = BucketBuilder(task)
         self.splits = SplitFinder(self.summarizer)
         self.series = SeriesAnalyzer(self.summarizer)
@@ -54,13 +48,10 @@ class DriftAnalyzer:
     def run(self) -> DriftAnalysisResult:
         config = self.config
         comparison_mode = self.windows.comparison
-        warnings = list(self.extractor.warnings)
 
         bucket, buckets = self._build_buckets()
-        warnings.extend(self.builder.warnings)
         summaries = [self.summarizer.bucket(item) for item in buckets]
 
-        # Series based analysis runs first so that the split search can leave transient buckets aside
         trend: dict[str, dict[str, Any]] = {}
         outliers: list[dict[str, Any]] = []
         series_ran = len(buckets) >= config.min_buckets_trend
@@ -68,12 +59,10 @@ class DriftAnalyzer:
             trend = self.series.trends(summaries)
             outliers = self.series.outliers(summaries)
 
-        # Split analysis
         min_side = self.splits.min_side_records
         change_point = None
         secondary: list[dict[str, Any]] = []
         comparison = None
-        # Insufficiency is judged by what the split needed, so a verdict is never "stable" on an untested split
         if comparison_mode:
             if self.current and self.reference:
                 comparison = self.splits.compare(self.reference, self.current, self.windows.start_date)
@@ -84,7 +73,6 @@ class DriftAnalyzer:
             insufficient_buckets = len(buckets) < config.min_buckets_changepoint
             if not insufficient_buckets:
                 change_point, secondary = self._change_points(buckets, outliers)
-                # No split at all means the search had too few buckets left after leaving transients aside
                 insufficient_buckets = change_point is None
             insufficient_data = len(self.current) < min_side or (
                 change_point is not None and not change_point["sides_sufficient"]
@@ -126,7 +114,6 @@ class DriftAnalyzer:
             },
             "data_quality": quality,
             "classes": self.summarizer.classes,
-            "warnings": warnings,
             "buckets": summaries if self.detail == DriftDetail.FULL
             else [self.summarizer.compact(item) for item in summaries],
             "change_point": change_point,
@@ -148,13 +135,6 @@ class DriftAnalyzer:
             buckets: Sequence[Bucket],
             outliers: Sequence[dict[str, Any]]
     ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
-        """Primary and secondary splits over the buckets that are not transient outliers
-
-        A single anomalous bucket would otherwise pull the best split next to itself and read as a persistent shift.
-        Only isolated outliers are transients: a run of flagged neighbours is a level change and stays in the search,
-        since a new level held by fewer than half the buckets is flagged bucket by bucket too. The search runs on the
-        remaining buckets and the reported indices refer to the full sequence.
-        """
         flagged = {item["bucket_index"] for item in outliers}
         excluded = {index for index in flagged if index - 1 not in flagged and index + 1 not in flagged}
         kept = [index for index in range(len(buckets)) if index not in excluded]
@@ -171,19 +151,14 @@ class DriftAnalyzer:
         return primary, secondary
 
     def _build_buckets(self) -> tuple[str, list[Bucket]]:
-        """Resolves the bucket size over both windows and builds the merged bucket sequence, reference first"""
         bucket = self.builder.choose(self.records, self.windows.total_days, self.requested_bucket)
         buckets: list[Bucket] = []
         if self.windows.comparison:
-            buckets.extend(self.builder.merge_small(self.builder.build(self.reference, bucket, DriftWindow.REFERENCE)))
-        buckets.extend(self.builder.merge_small(self.builder.build(self.current, bucket, DriftWindow.CURRENT)))
+            buckets.extend(self.builder.merge_small(self.builder.build(self.reference, bucket, DriftWindowMode.REFERENCE)))
+        buckets.extend(self.builder.merge_small(self.builder.build(self.current, bucket, DriftWindowMode.CURRENT)))
         return bucket, buckets
 
     def _hard_breaks(self, records: Sequence[Record]) -> list[dict[str, Any]]:
-        """Every position in the ordered records where a value that should never change silently changes
-
-        A detection threshold belongs to a class, so every class is tracked on its own and a break names the class.
-        """
         breaks: list[dict[str, Any]] = []
         last: dict[str, Any] = {}
 
@@ -242,7 +217,6 @@ class DriftAnalyzer:
         return []
 
     def _max_pairwise(self, buckets: Sequence[Bucket]) -> dict[str, dict[str, Any]]:
-        """Largest PSI between any two buckets, for the confidence and the class distribution"""
         if len(buckets) < 2:
             return {}
 

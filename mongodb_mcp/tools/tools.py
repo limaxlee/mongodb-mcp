@@ -860,7 +860,7 @@ async def mongodb_analyze_data_drift(
         model_name: Name of the inspection model, matched exactly together with the version as name/version
         model_version: Version of the inspection model
         start_date: Start of the analysed (current) window, inclusive, UTC like every date in and out of this tool
-        end_date: End of the analysed (current) window, exclusive
+        end_date: End of the analysed (current) window, inclusive
         task: Task of the model, cls or det, required only when the model string is used for both tasks
         gbm: Manufacturing site the inspections ran at, exact match
         process: Process the inspections ran in, exact match
@@ -870,7 +870,7 @@ async def mongodb_analyze_data_drift(
         bucket: Time bucket size, auto (default), 1h, 1d or 1w; auto picks by range length and volume
         detail: full (default) keeps every histogram and quantile per bucket, compact keeps only the scalar series
         reference_start_date: Start of the reference window for comparison mode, inclusive
-        reference_end_date: End of the reference window for comparison mode, exclusive, must precede start_date
+        reference_end_date: End of the reference window for comparison mode, inclusive, must not be after start_date
 
     Returns:
         Drift analysis with the following fields:
@@ -891,7 +891,6 @@ async def mongodb_analyze_data_drift(
                 missingConfidenceCount, missingImageSpecCount, parseErrorCount, parseErrorExamples: Skipped or degraded data
                 mergedBuckets: Start times of buckets merged into a neighbour for being too small
             classes: Every class the model output
-            warnings: Non fatal problems met while extracting
             buckets: Chronological per bucket statistics, each with the following fields:
                 startDate, endDate: UTC boundaries, window: current or reference
                 recordCount: Records in the bucket, mergedFrom: How many raw buckets were merged into it
@@ -900,8 +899,7 @@ async def mongodb_analyze_data_drift(
                   bins [0,0.1) ... [0.9,1.0] so buckets are comparable
                 belowThresholdRate: Share of predictions below their threshold, thresholdValues: Thresholds seen
                 imageSpecs: Distinct (width, height, channels) seen, medianElapsedTime: Median inference time
-                decisionDiffersRate, medianPatchWidth, medianPatchHeight, nearThresholdRate:
-                  Classification only
+                nearThresholdRate: Classification only
                 boxCount, meanBoxesPerImage, stdBoxesPerImage, boxesPerImageHistogram, noBoxRate, boxesByClassPerImage,
                   box: Detection only, box holds normalised geometry quantiles and a log10 area histogram
             changePoint: Range mode, the split with the largest divergence, searched over the buckets that are not

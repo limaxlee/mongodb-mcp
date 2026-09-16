@@ -1,3 +1,4 @@
-from .query import DriftQuery
-from .extractor import RecordExtractor, UnsupportedTaskError
+from .query import DriftQueryBuilder
+from .extractor import RecordExtractor
+from .window import DriftWindow
 from .drift import DriftAnalyzer

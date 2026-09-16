@@ -2,7 +2,7 @@ from datetime import datetime
 from pydantic import BaseModel, ConfigDict, Field, NonNegativeInt
 from pydantic.alias_generators import to_camel
 
-from common.constants import ModelTasks, LabelShape, TrainingStatus
+from common.constants import ModelTasks
 
 
 class AccessControl(BaseModel):
@@ -40,7 +40,7 @@ class LabelAttributes(BaseModel):
 
     count: NonNegativeInt = 0
     color: str = "#ff0000"
-    shape: LabelShape | None = None
+    shape: str | None = None
 
 
 class TrainingRecord(BaseModel):
@@ -50,7 +50,7 @@ class TrainingRecord(BaseModel):
     version: str
     start_time: datetime
     end_time: datetime
-    status: TrainingStatus
+    status: str
     training_info: str = ""
 
 

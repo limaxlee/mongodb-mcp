@@ -1,6 +1,6 @@
 import re
 from typing import Any
-from datetime import datetime, timezone
+from datetime import datetime
 from bson.objectid import ObjectId
 
 from common.constants import DATE_FORMAT
@@ -58,11 +58,3 @@ def generate_normalized_regex(value: str) -> dict[str, str]:
     pattern = r"\s*".join(re.escape(item) for item in re.sub(r"\s+", "", value))
     return {"$regex": pattern, "$options": "i"}
 
-
-def to_utc(value: Any) -> datetime | None:
-    """Treats naive datetimes as UTC, which is how MongoDB stores them; anything that is not a datetime becomes None"""
-    if not isinstance(value, datetime):
-        return None
-    if value.tzinfo is None:
-        return value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc)

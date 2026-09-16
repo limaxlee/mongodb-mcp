@@ -1,23 +1,20 @@
 from datetime import datetime
 from typing import Any
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
 
-from common.config import SETTINGS
 from common.constants import (
-    DriftTask, DriftMode, DriftWindow, DriftDetail, DriftFlag, PreVerdict, HardBreakKind, BucketSize
+    DriftTask, DriftMode, DriftWindowMode, DriftDetail,
+    DriftFlag, PreVerdict, HardBreakKind, BucketSize
 )
-from mongodb_mcp.utils import to_utc
 
 
 class DriftModel(BaseModel):
     model_config = ConfigDict(populate_by_name=True, alias_generator=to_camel)
 
 
-# Internal shapes, carried between the extraction and the analysis, never returned by the tool
-
 class BoxRecord(BaseModel):
-    """One bounding box of a detection record with its raw and image normalised geometry"""
     bbox_id: int | None = None
     prediction: str
     max_confidence: float | None = None
@@ -41,8 +38,7 @@ class BoxRecord(BaseModel):
 
 
 class Record(BaseModel):
-    """One prediction of the analysed model; detection records also carry their boxes"""
-    window: DriftWindow = DriftWindow.CURRENT
+    window: DriftWindowMode = DriftWindowMode.CURRENT
     inspection_id: str
     prediction_id: int | None = None
     created_at: datetime
@@ -56,18 +52,13 @@ class Record(BaseModel):
     classes: list[str] = []
     threshold: float | None = None
     elapsed_time: float | None = None
-    is_patch: bool = False
-    patch_width: float | None = None
-    patch_height: float | None = None
     image_width: int | None = None
     image_height: int | None = None
     image_channels: int | None = None
     # Classification
     prediction: str | None = None
-    decision: str | None = None
     max_confidence: float | None = None
     below_threshold: bool | None = None
-    decision_differs: bool = False
     near_threshold: bool | None = None
     # Detection
     boxes: list[BoxRecord] = []
@@ -89,10 +80,9 @@ class Record(BaseModel):
 
 
 class Bucket(BaseModel):
-    """The records that fall in one time bucket of one window"""
     start_date: datetime
     end_date: datetime
-    window: DriftWindow = DriftWindow.CURRENT
+    window: DriftWindowMode = DriftWindowMode.CURRENT
     records: list[Record] = []
     merged_from: int = 1
 
@@ -102,7 +92,6 @@ class Bucket(BaseModel):
 
 
 class SideCounts(BaseModel):
-    """Raw counts of a group of records, additive across groups so before/after histograms are exact sums"""
     record_count: int = 0
     box_count: int = 0
     confidence_counts: list[int] = []
@@ -148,65 +137,6 @@ class DateRange(DriftModel):
     days: float
 
 
-class DriftWindows(BaseModel):
-    """The analysed windows of a drift request, normalised to UTC and checked for consistency"""
-    start_date: datetime
-    end_date: datetime
-    reference_start_date: datetime | None = None
-    reference_end_date: datetime | None = None
-
-    @field_validator("start_date", "end_date", "reference_start_date", "reference_end_date")
-    @classmethod
-    def _utc(cls, value: datetime | None) -> datetime | None:
-        return to_utc(value)
-
-    @model_validator(mode="after")
-    def _check(self) -> "DriftWindows":
-        if self.start_date >= self.end_date:
-            raise ValueError("start_date must be before end_date")
-        if (self.reference_start_date is None) != (self.reference_end_date is None):
-            raise ValueError("reference_start_date and reference_end_date must be given together")
-        if self.reference_start_date is not None:
-            if self.reference_start_date >= self.reference_end_date:
-                raise ValueError("reference_start_date must be before reference_end_date")
-            if self.reference_end_date > self.start_date:
-                raise ValueError("The reference window must end before the current window starts")
-
-        max_days = SETTINGS.data_drift.max_total_days
-        if self.total_days > max_days:
-            raise ValueError(f"The analysed windows cover {self.total_days:.1f} days, the maximum is {max_days}")
-        return self
-
-    @property
-    def comparison(self) -> bool:
-        return self.reference_start_date is not None
-
-    @property
-    def current(self) -> DateRange:
-        return DateRange(start_date=self.start_date, end_date=self.end_date, days=self._days(self.start_date, self.end_date))
-
-    @property
-    def reference(self) -> DateRange | None:
-        if not self.comparison:
-            return None
-        return DateRange(
-            start_date=self.reference_start_date,
-            end_date=self.reference_end_date,
-            days=self._days(self.reference_start_date, self.reference_end_date)
-        )
-
-    @property
-    def total_days(self) -> float:
-        reference = self.reference
-        return self.current.days + (reference.days if reference else 0.0)
-
-    @staticmethod
-    def _days(start: datetime, end: datetime) -> float:
-        return (end - start).total_seconds() / 86400
-
-
-# Result shapes
-
 class ConfidenceQuantiles(DriftModel):
     p05: float | None = None
     p10: float | None = None
@@ -248,10 +178,9 @@ class BoxSummary(DriftModel):
 
 
 class CompactBucketSummary(DriftModel):
-    """The scalar series of a bucket, everything the compact detail level keeps"""
     start_date: datetime
     end_date: datetime
-    window: DriftWindow = DriftWindow.CURRENT
+    window: DriftWindowMode = DriftWindowMode.CURRENT
     record_count: int
     merged_from: int = 1
     class_distribution: dict[str, float] = {}
@@ -272,10 +201,6 @@ class BucketSummary(CompactBucketSummary):
     threshold_values: list[float] | None = None
     image_specs: list[list[int]] | None = None
     median_elapsed_time: float | None = None
-    # Classification only
-    decision_differs_rate: float | None = None
-    median_patch_width: float | None = None
-    median_patch_height: float | None = None
     # Detection only
     box_count: int | None = None
     std_boxes_per_image: float | None = None
@@ -384,7 +309,6 @@ class DriftAnalysisResult(DriftModel):
     status: AnalysisStatus
     data_quality: DataQuality
     classes: list[str] = []
-    warnings: list[str] = []
     buckets: list[BucketSummary] = []
     change_point: SplitComparison | None = None
     secondary_change_points: list[SplitComparison] = []

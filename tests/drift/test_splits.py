@@ -17,7 +17,7 @@ def records_for(task, days, per_day, confidence_for_day, ng_rate=0.2, **kwargs):
         rows = generate_rows(task, days, per_day, lambda rng, day: cls_prediction(rng, confidence_for_day(day), ng_rate, **kwargs))
     extractor = RecordExtractor()
     for row in rows:
-        extractor.add(row)
+        extractor.add_record(row)
     return extractor.records
 
 

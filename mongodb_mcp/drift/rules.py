@@ -1,4 +1,3 @@
-"""Deterministic rule engine producing flags and the pre-verdict from an assembled analysis"""
 from typing import Any
 
 from common.config import SETTINGS
@@ -8,8 +7,6 @@ from common.constants import (
 
 
 class DriftRules:
-    """Turns the computed statistics into flags, and the flags into a pre-verdict"""
-
     SHIFT_FLAGS = [
         DriftFlag.CONFIDENCE_SHIFT, DriftFlag.CLASS_SHIFT, DriftFlag.BOX_COUNT_SHIFT, DriftFlag.BOX_GEOMETRY_SHIFT
     ]
@@ -38,7 +35,6 @@ class DriftRules:
         if split is not None and split.get("sides_sufficient"):
             flags.extend(self._split_flags(split))
 
-        # Every class share trend collapses into one flag, so a single class shift can't count as several trends
         trend_flags: list[DriftFlag] = []
         for name, item in trend.items():
             if not item.get("meaningful"):
@@ -57,7 +53,7 @@ class DriftRules:
 
     def _split_flags(self, split: dict[str, Any]) -> list[DriftFlag]:
         config = self.config
-        flags: list[DriftFlag] = []
+        flags = []
 
         psi_confidence = split.get("psi_confidence", 0.0)
         if psi_confidence >= config.psi_significant:
@@ -97,8 +93,6 @@ class DriftRules:
         if any(flag.startswith("INSUFFICIENT_") for flag in flags):
             return PreVerdict.UNDETERMINED
 
-        # Series of one family move together (a confidence decline trends p50, mean and the below threshold rate
-        # at once), so trends are counted per family, not per series
         trend_count = len({TREND_FLAG_FAMILY[flag] for flag in flags if flag in TREND_FLAG_FAMILY})
         verdicts = {FLAG_VERDICT[flag] for flag in flags if flag in FLAG_VERDICT}
         if PreVerdict.DRIFT_LIKELY in verdicts or trend_count >= 2:
