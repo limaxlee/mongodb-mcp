@@ -9,6 +9,9 @@ data_drift:
   max_total_days: 30
   max_buckets: 60
 
+  # Maximum records analysed over both windows, buckets are thinned evenly in time to stay within it, 0 disables it
+  record_budget: 15000
+
   # Minimum records per bucket, used by the automatic bucket choice and for merging small buckets
   min_bucket_records_cls: 200
   min_bucket_records_det: 100

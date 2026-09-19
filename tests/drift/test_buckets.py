@@ -1,17 +1,18 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from common.config import SETTINGS
 from common.constants import BucketSize, DriftWindowMode
 from mongodb_mcp.drift import RecordExtractor
 from mongodb_mcp.drift.buckets import BucketBuilder
-from tests.drift.synthetic import generate_rows, cls_prediction, det_prediction
+from tests.drift.synthetic import generate_rows, cls_prediction, det_prediction, START
 
 
-def records_for(days: int, per_day: int, task: str = "cls"):
+def records_for(days: int, per_day: int, task: str = "cls", first_day: int = 0):
+    start, first_index = START + timedelta(days=first_day), first_day * per_day
     if task == "det":
-        rows = generate_rows(task, days, per_day, lambda rng, day: det_prediction(rng, 0.9, 0.02))
+        rows = generate_rows(task, days, per_day, lambda rng, day: det_prediction(rng, 0.9, 0.02), start=start, first_index=first_index)
     else:
-        rows = generate_rows(task, days, per_day, lambda rng, day: cls_prediction(rng, 0.9, 0.02))
+        rows = generate_rows(task, days, per_day, lambda rng, day: cls_prediction(rng, 0.9, 0.02), start=start, first_index=first_index)
     extractor = RecordExtractor()
     for row in rows:
         extractor.add_record(row)
@@ -120,3 +121,58 @@ class TestMerge:
         builder = BucketBuilder("cls")
         merged = builder.merge_small(builder.build(records_for(days=1, per_day=10), BucketSize.WEEK))
         assert len(merged) == 1 and builder.merged_start_dates == []
+
+
+class TestBudget:
+    def test_thin_is_even_and_deterministic(self):
+        records = records_for(days=1, per_day=10)
+        kept = BucketBuilder.thin(records, 3)
+
+        assert kept == [records[0], records[3], records[6]]
+        assert BucketBuilder.thin(records, 3) == kept
+        assert BucketBuilder.thin(records, 10) == records
+        assert BucketBuilder.thin(records, 25) == records
+        assert BucketBuilder.thin(records, 0) == []
+
+    def test_zero_budget_disables_thinning(self):
+        builder = BucketBuilder("cls")
+        buckets = builder.build(records_for(days=3, per_day=300), BucketSize.DAY)
+
+        assert builder.apply_budget(buckets, 0) is buckets
+
+    def test_budget_above_total_leaves_buckets_alone(self):
+        builder = BucketBuilder("cls")
+        buckets = builder.build(records_for(days=3, per_day=300), BucketSize.DAY)
+
+        assert builder.apply_budget(buckets, 900) is buckets
+        assert builder.apply_budget(buckets, 10_000) is buckets
+
+    def test_budget_is_shared_in_proportion(self):
+        builder = BucketBuilder("cls")
+        records = records_for(days=2, per_day=600) + records_for(days=1, per_day=1200, first_day=2)
+        buckets = builder.build(records, BucketSize.DAY)
+        thinned = builder.apply_budget(buckets, 1200)
+
+        assert [item.record_count for item in thinned] == [300, 300, 600]
+        assert sum(item.record_count for item in thinned) <= 1200
+        assert [item.start_date for item in thinned] == [item.start_date for item in buckets]
+        assert [item.record_count for item in buckets] == [600, 600, 1200]
+        for before, after in zip(buckets, thinned):
+            assert after.records == BucketBuilder.thin(before.records, after.record_count)
+            assert [record.created_at for record in after.records] == sorted(record.created_at for record in after.records)
+
+    def test_bucket_never_drops_below_minimum(self):
+        builder = BucketBuilder("cls")
+        minimum = builder.min_records
+        buckets = builder.build(records_for(days=4, per_day=minimum * 2), BucketSize.DAY)
+        thinned = builder.apply_budget(buckets, minimum)
+
+        assert all(item.record_count == minimum for item in thinned)
+
+    def test_small_bucket_keeps_everything(self):
+        builder = BucketBuilder("cls")
+        records = records_for(days=1, per_day=50) + records_for(days=3, per_day=2000, first_day=1)
+        buckets = builder.build(records, BucketSize.DAY)
+        thinned = builder.apply_budget(buckets, 1000)
+
+        assert thinned[0].record_count == buckets[0].record_count < builder.min_records

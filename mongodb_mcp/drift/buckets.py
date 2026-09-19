@@ -87,6 +87,36 @@ class BucketBuilder:
 
         return bucket
 
+    def apply_budget(self, buckets: list[Bucket], budget: int) -> list[Bucket]:
+        """Thin the buckets evenly in time so that together they hold at most `budget` records
+
+        A budget of 0 disables thinning. Every bucket keeps its share of the budget in proportion to its size, and
+        never fewer than the minimum bucket size (or all of its records when it has fewer), so that the sufficiency
+        rules keep working; that floor can push the total slightly above the budget.
+        """
+        total = sum(item.record_count for item in buckets)
+        if budget <= 0 or total <= budget:
+            return buckets
+
+        ratio = budget / total
+        thinned: list[Bucket] = []
+        for item in buckets:
+            keep = max(min(item.record_count, self.min_records), int(item.record_count * ratio))
+            thinned.append(item.model_copy(update={"records": self.thin(item.records, keep)}))
+
+        return thinned
+
+    @staticmethod
+    def thin(records: list[Record], keep: int) -> list[Record]:
+        """Deterministic evenly spaced subset of `keep` records, in the original order"""
+        total = len(records)
+        if keep >= total:
+            return list(records)
+        if keep <= 0:
+            return []
+
+        return [records[(index * total) // keep] for index in range(keep)]
+
     def merge_small(self, buckets: list[Bucket]) -> list[Bucket]:
         items = [item.model_copy(update={"records": list(item.records)}) for item in buckets]
 

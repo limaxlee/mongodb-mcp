@@ -886,8 +886,11 @@ async def mongodb_analyze_data_drift(
             dataQuality: Volume and problems of the scanned data, with the following fields:
                 scannedDocumentCount: Documents matching the filters
                 matchedDocumentCount, matchedEntryCount: Documents and aiResults entries that produced records
-                recordCount: Predictions analysed (images for detection)
-                boxCount: Bounding boxes analysed, detection only
+                recordCount: Predictions extracted (images for detection)
+                boxCount: Bounding boxes extracted, detection only
+                analyzedRecordCount, samplingRatio: Predictions kept for the statistics after the record budget
+                  (config.recordBudget, 0 disables it) thinned every bucket evenly in time; equal to recordCount
+                  and 1.0 when the budget did not apply
                 missingConfidenceCount, missingImageSpecCount, parseErrorCount, parseErrorExamples: Skipped or degraded data
                 mergedBuckets: Start times of buckets merged into a neighbour for being too small
             classes: Every class the model output

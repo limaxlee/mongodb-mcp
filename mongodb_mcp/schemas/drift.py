@@ -280,6 +280,8 @@ class DataQuality(DriftModel):
     matched_entry_count: int = 0
     record_count: int = 0
     box_count: int | None = None
+    analyzed_record_count: int = 0
+    sampling_ratio: float = 1.0
     missing_confidence_count: int = 0
     missing_image_spec_count: int = 0
     parse_error_count: int = 0

@@ -115,7 +115,8 @@ tool argument validation (fastmcp)
        RecordExtractor         one instance, rows of the reference window first, then the current window
        no records at all       ValueError "No inspection results found ..."
        DriftAnalyzer.run()     in a thread so the server stays responsive
-            BucketBuilder      choose the bucket size on all records, build and merge per window
+            BucketBuilder      choose the bucket size on all records, build and merge per window,
+                               then thin the buckets evenly in time to the record budget
             Summarizer         one summary per bucket
             SeriesAnalyzer     trends and outliers over the summaries
             SplitFinder        change point (range mode, isolated outliers left aside) or fixed comparison
@@ -306,6 +307,38 @@ carries `INSUFFICIENT_BUCKETS` and an `undetermined` verdict. With `bucket="auto
 weekly buckets (two of five raw buckets are small, 40 % is above the 30 % share), landing in three calendar weeks
 with no merge needed, and still three buckets. The real problem in such a case is sparsity, not bucketing; a
 comparison against an earlier reference window is the mode that can still produce a verdict.
+
+#### 5.4.5 Record budget (`apply_budget`)
+
+Every record costs extraction, memory and analysis time, and a tool call that runs longer than the MCP client's
+timeout is cancelled by the client (the server log then shows `Request N cancelled - duplicate response
+suppressed`). High volume models with tens of thousands of predictions in a window hit that limit. `record_budget`
+(15 000 by default, `0` disables it) caps the number of records the statistics are computed on, over both windows
+together.
+
+The budget is applied **after** the bucket size is chosen and the small buckets are merged, so both decisions rest
+on the real volumes. When the buckets together hold more records than the budget, every bucket keeps its share in
+proportion to its size: a bucket with 10 % of the records keeps 10 % of the budget. Within a bucket the kept
+records are an **evenly spaced subset in time** (record `0, n/k, 2n/k, ...` of the chronologically ordered bucket),
+never a random draw, so the same request always yields the same result and every part of the period stays
+represented. A bucket never drops below `MIN_N` (or below its own size when it is smaller), so the sufficiency
+rules of section 5.7 are not affected by the thinning; that floor can push the total slightly above the budget.
+
+What the budget changes and what it does not:
+
+- Bucket `recordCount`, `boxCount` and every histogram, quantile and divergence describe the kept records.
+  `dataQuality.recordCount` and `boxCount` still count everything that was extracted; `analyzedRecordCount` and
+  `samplingRatio` say how much of it the statistics rest on (`samplingRatio = 1.0` when the budget did not apply).
+- Hard breaks (section 5.8) are scanned over **every** extracted record, because a configuration change is a point
+  event that thinning could skip.
+- `scannedDocumentCount`, `matchedDocumentCount` and `matchedEntryCount` are unaffected.
+
+*Why thinning instead of a hard error:* the reader asked a question about a period and deserves an answer. A few
+thousand evenly spread predictions per bucket estimate a histogram or a class share as well as the full set for
+the purposes of this tool; the divergence measures are computed on proportions and the tests are already gated by
+the sufficiency rules. *Why evenly spaced:* deterministic, order preserving and free of a random seed to
+reproduce. *Why not at extraction time:* the bucket choice and the merge need the true counts, and the number of
+predictions is only known once the cursor is consumed.
 
 ### 5.5 Summaries (`Summarizer`)
 
@@ -547,6 +580,7 @@ Every value below is a field of `DataDriftConfig` in `common/config.py`, filled 
 |---|---|---|
 | `max_total_days` | 30 | `DriftWindow`: both windows together may not exceed it |
 | `max_buckets` | 60 | `BucketBuilder`: coarsen while more buckets would result |
+| `record_budget` | 15000 | `BucketBuilder`: maximum records analysed over both windows, buckets are thinned evenly in time to stay within it, `0` disables it (section 5.4.5) |
 | `min_bucket_records_cls` / `_det` | 200 / 100 | `BucketBuilder`: automatic size choice and small bucket merging |
 | `small_bucket_share` | 0.3 | `BucketBuilder`: share of small buckets that triggers coarsening |
 | `min_side_records_cls` / `_det` | 500 / 300 | `SplitFinder`: records each side of a split needs |
@@ -606,8 +640,9 @@ Read this first. When `analysisPossible` is false the rest is descriptive only.
 |---|---|
 | `scannedDocumentCount` | documents matching the filters, both windows |
 | `matchedDocumentCount`, `matchedEntryCount` | documents and `aiResults` entries that produced records |
-| `recordCount` | predictions analysed (images for detection) |
-| `boxCount` | boxes analysed, detection only |
+| `recordCount` | predictions extracted (images for detection) |
+| `boxCount` | boxes extracted, detection only |
+| `analyzedRecordCount`, `samplingRatio` | predictions kept for the statistics after the record budget (section 5.4.5), and their share of `recordCount`; equal to `recordCount` and `1.0` when the budget did not apply |
 | `missingConfidenceCount`, `missingImageSpecCount` | predictions or boxes without a confidence, records without an image size |
 | `parseErrorCount`, `parseErrorExamples` | rows or boxes skipped as malformed, with example ids |
 | `mergedBuckets` | start dates of the raw buckets that were merged into a neighbour for being too small (section 5.4.3) |
@@ -754,6 +789,9 @@ Trend families: confidence (`median_confidence`, `mean_confidence`, `below_thres
   ignored. Pass `task` to make the choice explicit.
 - Malformed rows: skipped and counted, never fatal. A prediction without a usable confidence is not malformed: it is
   kept with a null confidence and counted in `missingConfidenceCount`.
+- More records than `record_budget`: every bucket is thinned to an evenly spaced subset in time, `samplingRatio`
+  drops below `1.0` and the bucket counts describe the kept records (section 5.4.5). Hard breaks still see every
+  record. Set `record_budget: 0` to analyse everything, at the price of longer calls.
 
 Known limitations, deliberately left as they are:
 

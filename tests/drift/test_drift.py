@@ -380,3 +380,72 @@ class TestWindows:
         windows = DriftWindow(start_date=START.replace(tzinfo=None), end_date=END.replace(tzinfo=None))
         assert windows.start_date == START and windows.start_date.tzinfo == timezone.utc
         assert windows.end_date == END
+
+
+class TestRecordBudget:
+    @staticmethod
+    def with_budget(monkeypatch, budget: int):
+        monkeypatch.setattr(SETTINGS, "data_drift", SETTINGS.data_drift.model_copy(update={"record_budget": budget}))
+
+    def test_default_budget_is_not_reached(self):
+        rows = generate_rows("cls", DAYS, 400, lambda rng, day: cls_prediction(rng, 0.93, 0.2), seed=3)
+        result = analyze(rows)
+
+        assert result.config["record_budget"] == SETTINGS.data_drift.record_budget
+        assert result.data_quality.analyzed_record_count == result.data_quality.record_count == len(rows)
+        assert result.data_quality.sampling_ratio == 1.0
+
+    def test_budget_thins_buckets_and_keeps_the_verdict(self, monkeypatch):
+        self.with_budget(monkeypatch, 3000)
+        rows = generate_rows("cls", DAYS, 400, lambda rng, day: cls_prediction(rng, 0.93 if day < 7 else 0.8, 0.2))
+        result = analyze(rows)
+
+        assert result.config["record_budget"] == 3000
+        assert result.data_quality.record_count == len(rows)
+        assert result.data_quality.analyzed_record_count <= 3000
+        assert result.data_quality.analyzed_record_count == sum(item.record_count for item in result.buckets)
+        assert 0 < result.data_quality.sampling_ratio < 1
+        assert all(item.record_count == 3000 // DAYS for item in result.buckets)
+        assert result.change_point.before_count + result.change_point.after_count == result.data_quality.analyzed_record_count
+        assert DriftFlag.CONFIDENCE_SHIFT in result.flags
+        assert result.change_point.bucket_index == 7 and result.pre_verdict == PreVerdict.DRIFT_LIKELY
+
+    def test_zero_budget_disables_it(self, monkeypatch):
+        self.with_budget(monkeypatch, 0)
+        rows = generate_rows("cls", DAYS, 400, lambda rng, day: cls_prediction(rng, 0.93, 0.2), seed=3)
+        result = analyze(rows)
+
+        assert result.config["record_budget"] == 0
+        assert result.data_quality.analyzed_record_count == len(rows)
+        assert result.data_quality.sampling_ratio == 1.0
+
+    def test_budget_applies_over_both_windows(self, monkeypatch):
+        self.with_budget(monkeypatch, 2800)
+        reference = generate_rows("cls", 7, 400, lambda rng, day: cls_prediction(rng, 0.93, 0.2), seed=1)
+        current = generate_rows(
+            "cls", 7, 400, lambda rng, day: cls_prediction(rng, 0.8, 0.2),
+            start=START + timedelta(days=7), seed=2, first_index=len(reference)
+        )
+        extractor = extract(current, reference_rows=reference)
+        windows = DriftWindow(START + timedelta(days=7), START + timedelta(days=14), START, START + timedelta(days=7))
+        result = DriftAnalyzer("Metal", "1.0", "cls", extractor, windows, FILTERS).run()
+
+        assert result.data_quality.record_count == 5600
+        assert result.data_quality.analyzed_record_count == 2800
+        assert result.comparison.before_count == result.comparison.after_count == 1400
+        assert DriftFlag.CONFIDENCE_SHIFT in result.flags
+
+    def test_hard_breaks_are_scanned_on_every_record(self, monkeypatch):
+        # A budget of 2000 leaves every daily bucket with its minimum of 200 out of 400 records, so thinning keeps
+        # the even offsets within a bucket. A camera change on an odd offset is dropped from the statistics but must
+        # still be found by the hard break scan
+        self.with_budget(monkeypatch, 2000)
+        rows = generate_rows("cls", DAYS, 400, lambda rng, day: cls_prediction(rng, 0.93, 0.2), seed=3)
+        index = 7 * 400 + 101
+        rows[index] = make_row(index, rows[index]["createdAt"], "cls", rows[index]["prediction"], image=(800, 600, 3))
+        result = analyze(rows)
+
+        assert all(item.record_count == SETTINGS.data_drift.min_bucket_records_cls for item in result.buckets)
+        breaks = [item for item in result.hard_breaks if item.kind == HardBreakKind.IMAGE_SPEC]
+        assert [item.inspection_id for item in breaks] == [rows[index]["_id"], rows[index + 1]["_id"]]
+        assert [(item.from_value, item.to_value) for item in breaks] == [([400, 400, 3], [800, 600, 3]), ([800, 600, 3], [400, 400, 3])]

@@ -1,7 +1,7 @@
 import os
 import yaml
 import argparse
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from pydantic_settings import BaseSettings
 
 from common.constants import ROOT_DIR
@@ -49,6 +49,9 @@ class DataDriftConfig(BaseModel):
     # Range limits
     max_total_days: int = 30
     max_buckets: int = 60
+
+    # Maximum records analysed over both windows; buckets are thinned evenly in time to stay within it, 0 disables it
+    record_budget: int = Field(default=15000, ge=0)
 
     # Minimum records per bucket, used by the automatic bucket choice and for merging small buckets
     min_bucket_records_cls: int = 200

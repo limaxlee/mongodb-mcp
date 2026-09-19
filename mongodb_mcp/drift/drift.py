@@ -50,6 +50,10 @@ class DriftAnalyzer:
         comparison_mode = self.windows.comparison
 
         bucket, buckets = self._build_buckets()
+        buckets = self.builder.apply_budget(buckets, config.record_budget)
+        analyzed = [record for item in buckets for record in item.records]
+        current = [record for record in analyzed if record.window == DriftWindowMode.CURRENT]
+        reference = [record for record in analyzed if record.window == DriftWindowMode.REFERENCE]
         summaries = [self.summarizer.bucket(item) for item in buckets]
 
         trend: dict[str, dict[str, Any]] = {}
@@ -64,8 +68,8 @@ class DriftAnalyzer:
         secondary: list[dict[str, Any]] = []
         comparison = None
         if comparison_mode:
-            if self.current and self.reference:
-                comparison = self.splits.compare(self.reference, self.current, self.windows.start_date)
+            if current and reference:
+                comparison = self.splits.compare(reference, current, self.windows.start_date)
             insufficient_data = comparison is None or not comparison["sides_sufficient"]
             insufficient_buckets = False
             split = comparison
@@ -74,7 +78,7 @@ class DriftAnalyzer:
             if not insufficient_buckets:
                 change_point, secondary = self._change_points(buckets, outliers)
                 insufficient_buckets = change_point is None
-            insufficient_data = len(self.current) < min_side or (
+            insufficient_data = len(current) < min_side or (
                 change_point is not None and not change_point["sides_sufficient"]
             )
             split = change_point
@@ -90,6 +94,8 @@ class DriftAnalyzer:
         quality.update({
             "record_count": len(self.records),
             "box_count": box_count,
+            "analyzed_record_count": len(analyzed),
+            "sampling_ratio": len(analyzed) / len(self.records) if self.records else 1.0,
             "merged_buckets": self.builder.merged_start_dates
         })
         reference_range = self.windows.reference
@@ -151,6 +157,7 @@ class DriftAnalyzer:
         return primary, secondary
 
     def _build_buckets(self) -> tuple[str, list[Bucket]]:
+        """Buckets over every record; the bucket size and the merging are decided on the real volumes"""
         bucket = self.builder.choose(self.records, self.windows.total_days, self.requested_bucket)
         buckets: list[Bucket] = []
         if self.windows.comparison:
