@@ -904,8 +904,8 @@ async def mongodb_analyze_data_drift(
                   threshold, null when the model has no threshold
                 meanBoxesPerImage, noBoxRate: Detection only
                 meanElapsedTime: Mean inference time
-                backends, thresholds, thresholdsByClass: Runtime configuration seen; more than one value inside a
-                  period is a configuration change inside that period
+                backends, thresholdsByClass: Runtime configuration seen (threshold per predicted class for both
+                  tasks); more than one value inside a period is a configuration change inside that period
                 confidenceHistogram, confidenceQuantiles, boxesPerImageHistogram, perClass: Full detail only;
                   perClass holds count, share, meanConfidence, stdConfidence, belowThresholdRate,
                   nearThresholdRate, threshold and confidenceHistogram per predicted class
@@ -924,8 +924,8 @@ async def mongodb_analyze_data_drift(
                 meanConfidenceDelta, belowThresholdRateDelta, elapsedTimeRatio: Direction of the move
                 before, after: Summary of each side including its histograms and per-class blocks
             comparison: Comparison mode, reference (before) versus current (after) with the changePoint fields
-            hardBreaks: Configuration changes between consecutive periods: backend, threshold (per class for
-              detection, with className) or classes, each with date, from and to
+            hardBreaks: Configuration changes between consecutive periods: backend, threshold (per predicted
+              class, with className) or classes, each with date, from and to
             flags: Deterministic rule results: CONFIDENCE_SHIFT, CONFIDENCE_SHIFT_MODERATE, CLASS_SHIFT,
               CLASS_SHIFT_MODERATE, BOX_COUNT_SHIFT, THRESHOLD_PRESSURE, HARD_BREAK, INSUFFICIENT_DATA,
               INSUFFICIENT_PERIODS, INCOMPATIBLE_BINS

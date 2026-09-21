@@ -52,7 +52,7 @@ class TestStatisticsQuery:
         assert condition == {"$eq": ["$$item.equipmentId", "EQ-01"]}
         pipeline = StatisticsQuery("MetalCls", "1.0", START, END, Granularity.DAILY, equipment_id="EQ-01").build_pipeline()
         assert pipeline[2]["$addFields"]["configBackends"] == ["$block.backend"]
-        assert pipeline[2]["$addFields"]["configThresholds"] == ["$block.threshold"]
+        assert "configThresholds" not in pipeline[2]["$addFields"]
 
     def test_pipeline_shape(self):
         query = StatisticsQuery("MetalCls", "1.0", START, END, Granularity.DAILY, task="cls")

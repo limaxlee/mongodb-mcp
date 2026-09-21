@@ -46,7 +46,7 @@ Drift 분석에 필요한 것은 "prediction 하나하나"가 아니라 **"이 �
 | Threshold 관련 개수 | confidence가 threshold 미만인 prediction 수, threshold 근처(±0.05)인 prediction 수 |
 | 이미지당 box 수 (det) | box가 0개, 1개, 2개, ... 인 이미지가 각각 몇 개인지의 histogram, box가 없는 이미지 수 |
 | 추론 시간 | elapsed time의 개수와 합계 |
-| 실행 환경 | backend, threshold 값 (설정 변경 감지용) |
+| 실행 환경 | backend, class별 threshold 값 (설정 변경 감지용) |
 | 품질 | confidence가 없거나 파싱에 실패한 prediction 수 |
 
 **Confidence histogram이 핵심인 이유.** 두 기간의 histogram을 나란히 놓으면 "모델이 예전보다 덜 확신한다"는 것이 구간별 개수 차이로 바로 보인다. 그리고 histogram은 더할 수 있으므로, 어떤 기간 조합이든 정확한 분포를 다시 만들 수 있다. 평균 하나만 저장하면 이런 비교가 불가능하다.
@@ -80,7 +80,6 @@ Drift 분석에 필요한 것은 "prediction 하나하나"가 아니라 **"이 �
       "equipmentId": "SEHC_Side_VM07",
       "location": "VM07",
       "backend": "ts",
-      "threshold": 0.5,
       "inspectionCount": 118,
       "predictionCount": 2360,
       "quality": { "missingConfidenceCount": 0, "parseErrorCount": 0 },
@@ -95,8 +94,8 @@ Drift 분석에 필요한 것은 "prediction 하나하나"가 아니라 **"이 �
         "nearThresholdCount": 15
       },
       "perClass": {
-        "OK": { "...confidence와 같은 구조, OK로 예측된 prediction만..." },
-        "NG": { "...NG로 예측된 prediction만..." }
+        "OK": { "threshold": 0.5, "...confidence와 같은 구조, OK로 예측된 prediction만..." },
+        "NG": { "threshold": 0.5, "...NG로 예측된 prediction만..." }
       }
     },
     { "equipmentId": "SEHC_Side_VM08", "location": "VM08", "..." : "..." }
@@ -105,7 +104,7 @@ Drift 분석에 필요한 것은 "prediction 하나하나"가 아니라 **"이 �
 ```
 
 - `bins`는 histogram의 구간 정의다. 분석 tool은 이 값을 document에서 읽으므로, 나중에 구간을 바꾸더라도 tool 수정 없이 동작한다. 단, 구간이 다른 document끼리는 비교하지 않는다.
-- Detection 모델은 `confidence`, `classCounts`, `perClass`가 bounding box 기준이고, `boxCount`와 `images`(이미지당 box 수 histogram, box 없는 이미지 수) 항목이 추가된다. threshold는 class별로 `perClass` 안에 들어간다.
+- Detection 모델은 `confidence`, `classCounts`, `perClass`가 bounding box 기준이고, `boxCount`와 `images`(이미지당 box 수 histogram, box 없는 이미지 수) 항목이 추가된다. threshold는 두 task 모두 class별로 `perClass` 안에 들어간다.
 - Index: `(modelName, modelVersion, task, mode, gbm, process, granularity, startDate, productId)` unique index 1개와, 보관 기간용 `startDate` TTL index
 
 ### 4. Drift 분석은 어떻게 하는가
@@ -114,7 +113,7 @@ Drift 분석에 필요한 것은 "prediction 하나하나"가 아니라 **"이 �
 
 **(1) 언제 바뀌었나 — 기간별 시계열과 연속 비교**
 
-요청한 기간을 period 단위로 나열하고(예: 최근 30일을 하루씩), 각 period의 평균 confidence, class 비율, threshold 미만 비율 등을 보여준다. 그리고 **각 period를 바로 앞 period와 비교한 PSI**를 함께 준다. 어느 날 갑자기 PSI가 튀면 그날이 변화 시점이다.
+요청한 기간을 period 단위로 나열하고(예: 최근 30일을 하루씩), 각 period의 평균 confidence, class 비율, threshold 미만 비율 등을 보여준다. Period 종류는 직접 지정할 수도 있고 tool에 맡길 수도 있다. 맡기면 전체 기간이 60개 period 이내에 들어오는 가장 세밀한 종류를 고른다. 즉 2.5일까지는 hourly, 30일까지는 shift, 60일까지는 daily, 그 이상은 weekly로 보여준다. 그리고 **각 period를 바로 앞 period와 비교한 PSI**를 함께 준다. 어느 날 갑자기 PSI가 튀면 그날이 변화 시점이다.
 
 **(2) 얼마나 바뀌었나 — PSI (Population Stability Index)**
 

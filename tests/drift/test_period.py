@@ -32,7 +32,8 @@ class TestBuildPeriods:
         assert period.bins == [doc["bins"]]
         assert period.prediction_count == 300 and period.inspection_count == 30 and period.box_count is None
         assert period.no_box_count is None and period.boxes_per_image_histogram == []
-        assert period.backends == ["ts"] and period.thresholds == [0.8]
+        assert period.backends == ["ts"]
+        assert period.per_class["Good"].thresholds == [0.8] and period.per_class["NG"].thresholds == [0.8]
         assert period.elapsed_count == 300 and math.isclose(period.elapsed_sum, 300 * 0.008)
 
     def test_confidence_counts_of_a_single_document_keep_the_quantiles(self):
@@ -83,13 +84,13 @@ class TestBuildPeriods:
         assert period.box_count == total["boxCount"] and period.no_box_count == total["images"]["noBoxCount"]
         assert period.boxes_per_image_sum == total["images"]["boxesPerImage"]["sum"]
         assert period.boxes_per_image_histogram == total["images"]["boxesPerImage"]["histogram"]
-        assert period.thresholds == [] and period.per_class["Good"].thresholds == [0.8]
+        assert period.per_class["Good"].thresholds == [0.8]
 
     def test_null_threshold_gives_none_counts(self):
         documents, periods = documents_and_periods(periods=1, stats_kwargs_for_period=lambda i: {"threshold": None})
         assert periods[0].confidence.below_threshold_count is None
         assert periods[0].confidence.near_threshold_count is None
-        assert periods[0].thresholds == []
+        assert periods[0].per_class["Good"].thresholds == []
 
     def test_rows_without_date_are_skipped(self):
         assert build_periods([{"_id": {"kind": "total", "k": None}}], DriftWindowMode.CURRENT) == []
@@ -136,7 +137,8 @@ class TestPeriodSummarizer:
         assert summary.confidence_quantiles.p50 == total["confidence"]["quantiles"]["p50"]
         assert summary.mean_boxes_per_image is None and summary.no_box_rate is None
         assert math.isclose(summary.mean_elapsed_time, 0.008)
-        assert summary.backends == ["ts"] and summary.thresholds == [0.8] and summary.thresholds_by_class == {}
+        assert summary.backends == ["ts"] and summary.thresholds_by_class == {"Good": [0.8], "NG": [0.8]}
+        assert summary.per_class["Good"].threshold == 0.8
         assert set(summary.per_class) == {"Good", "NG"}
         assert summary.per_class["Good"].count == total["classCounts"]["Good"]
         assert math.isclose(summary.per_class["Good"].share, summary.class_distribution["Good"])
@@ -168,7 +170,7 @@ class TestPeriodSummarizer:
         assert math.isclose(summary.mean_boxes_per_image, total["boxCount"] / total["predictionCount"])
         assert math.isclose(summary.no_box_rate, total["images"]["noBoxCount"] / total["predictionCount"])
         assert math.isclose(sum(summary.boxes_per_image_histogram), 1.0)
-        assert summary.thresholds == [] and summary.thresholds_by_class == {"Good": [0.8], "NG": [0.8]}
+        assert summary.thresholds_by_class == {"Good": [0.8], "NG": [0.8]}
         assert summary.per_class["Good"].threshold == 0.8
 
     def test_missing_class_gets_zero(self):

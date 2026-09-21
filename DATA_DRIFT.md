@@ -84,9 +84,32 @@ Two modes exist:
   current periods at the fixed boundary between them instead of searching for a split.
 
 The windows together may cover at most `max_total_days` (400). The reference window must end before the current one
-starts. All dates are UTC, naive datetimes are treated as UTC. `auto` granularity picks the finest period type for
-which both windows together hold at most `max_periods` (60) periods: hourly up to 2.5 days, shift up to 30 days,
-daily up to 60 days, weekly beyond.
+starts. All dates are UTC, naive datetimes are treated as UTC.
+
+### 3.1 Automatic granularity
+
+An explicit `granularity` is used as given. With `auto`, `DriftWindow.resolve_granularity` takes the total span of
+the current and reference windows in hours and walks the period types from finest to coarsest, choosing the first
+one that yields at most `max_periods` (60) periods. Volume plays no part; only the span does.
+
+| Total span of both windows | Periods it would produce | Chosen |
+|---|---|---|
+| up to 2.5 days | up to 60 hourly | `hourly` |
+| 2.5 to 30 days | up to 60 shifts of 12 hours | `shift` |
+| 30 to 60 days | up to 60 daily | `daily` |
+| over 60 days | weekly, at most 57 for the 400-day maximum | `weekly` |
+
+A seven-day analysis therefore lands on `shift` (14 periods); pass `daily` explicitly to see seven days as seven
+periods. Two consequences:
+
+- The choice happens before the query, so it names the period type of the documents that get read. If the Data
+  Service has not written that granularity for the model, the result is "No inspection statistics found", not a
+  fallback to another type.
+- Because volume is ignored, a quiet line still gets hourly periods for a two-day range, and those periods will
+  often be reported as insufficient. The previous tool merged small buckets; this one leaves it to the caller to pick
+  a coarser granularity.
+
+`max_periods` is the only knob: lowering it moves every cut-off earlier.
 
 ---
 
@@ -121,11 +144,12 @@ One aggregation pipeline per window, run with `allowDiskUse`:
 
 1. `$match` on the unique index prefix of the collection: `modelName, modelVersion, task, mode, gbm, process,
    granularity, startDate range`, plus `productId` when given. `task` is `{$in: [cls, det]}` when not given.
-2. `$project` the identity fields, `bins`, `classes`, the equipment ids, backends and thresholds of `equipments[]`,
+2. `$project` the identity fields, `bins`, `classes`, the equipment ids and backends of `equipments[]`,
    and `block`: `$total`, or the `equipments[]` entry whose `equipmentId` matches (missing when absent).
 3. `$addFields` an `entries` array: one `total` entry with `block.confidence`, one `class` entry per key of
-   `block.perClass`, one `count` entry per key of `block.classCounts`; plus the backend and threshold values the
-   analysis should see (every equipment for the total, the requested one otherwise).
+   `block.perClass`, one `count` entry per key of `block.classCounts`; plus the backend values the analysis
+   should see (every equipment for the total, the requested one otherwise). Thresholds travel with the class
+   entries, since they are per predicted class for both tasks.
 4. `$unwind` the entries and `$group` by `(startDate, kind, class)`. Every additive number is `$sum`med, sets are
    `$addToSet`ed, histograms are `$push`ed, and a `present` flag records whether an optional field (box count,
    images block, threshold counts) ever existed in the group.
@@ -139,7 +163,7 @@ document whose `equipments[]` has no entry for the requested equipment still pro
 ### 5.2 Periods (`build_periods`, `PeriodCounts`)
 
 The rows of one window are grouped by period start into `PeriodCounts`: document, product, inspection, prediction
-and box counts, the sets seen (sites, modes, equipments, classes, bins, backends, thresholds), elapsed time sums,
+and box counts, the sets seen (sites, modes, equipments, classes, bins, backends), elapsed time sums,
 the images block for detection, the class counts, and a `ConfidenceCounts` for the total and for every predicted
 class (`count, sum, sumSq, min, max, histogram, belowThresholdCount, nearThresholdCount, thresholds, quantiles`).
 `quantiles` is kept only when the period is a single document, because quantiles are not additive.
@@ -182,10 +206,10 @@ sides are sufficient.
 
 ### 5.6 Hard breaks
 
-`backend`, `threshold` (per predicted class for detection) and `classes` are compared between consecutive periods.
-A change is a break dated at the later period. A period that itself carries several values (two products in the
-same hour with different backends) is a break to the list of values, dated at that period. The `total` block has
-no backend or threshold, so those come from the `equipments[]` entries of the documents.
+`backend`, `threshold` (per predicted class, for both tasks) and `classes` are compared between consecutive
+periods. A change is a break dated at the later period. A period that itself carries several values (two products in
+the same hour with different backends) is a break to the list of values, dated at that period. The `total` block has
+no backend, so the backends come from the `equipments[]` entries of the documents.
 
 ### 5.7 Bins
 
@@ -297,12 +321,12 @@ One entry per period, reference periods first in comparison mode.
 | `belowThresholdRate`, `nearThresholdRate` | share of predictions below / within the margin of the threshold; null when the model has no threshold |
 | `meanBoxesPerImage`, `noBoxRate` | detection only |
 | `meanElapsedTime` | mean inference time |
-| `backends`, `thresholds`, `thresholdsByClass` | runtime configuration seen; more than one value inside a period is a configuration change inside it |
+| `backends`, `thresholdsByClass` | runtime configuration seen, thresholds per predicted class; more than one value inside a period is a configuration change inside it |
 
 Full detail adds `confidenceHistogram` (proportions over `bins.confidenceEdges`), `confidenceQuantiles` (only when
 `medianSource` is `exact`), `boxesPerImageHistogram` (detection, bins `0, 1, ..., max+`), and `perClass`: per
 predicted class `count`, `share`, `meanConfidence`, `stdConfidence`, `belowThresholdRate`, `nearThresholdRate`,
-`threshold` (detection) and `confidenceHistogram`.
+`threshold` and `confidenceHistogram`.
 
 ### 8.5 `consecutive`
 
@@ -326,7 +350,7 @@ One entry per period after the first: `periodIndex`, `date`, `psiConfidence`, `p
 
 ### 8.7 `hardBreaks`
 
-Entries with `kind` (`backend`, `threshold`, `classes`), `className` (detection thresholds), `date`, `from`, `to`.
+Entries with `kind` (`backend`, `threshold`, `classes`), `className` (threshold breaks), `date`, `from`, `to`.
 
 ### 8.8 `flags`, `preVerdict`, `config`
 
@@ -403,8 +427,8 @@ you need is already in the JSON. You confirm or overrule the `preVerdict` field 
 - `changePoint` (range) or `comparison` (comparison) is the main before/after evidence. `date` is where the after
   side starts. `sidesSufficient` must be true for the divergence values to be trusted. `psiConfidenceByClass` says
   which class moved. `before` and `after` hold the histograms and class shares of each side.
-- `hardBreaks` lists configuration changes found in the data: threshold (model configuration, `className` for
-  detection), backend (runtime), classes (output space). A hard break must be confirmed with the line owner before
+- `hardBreaks` lists configuration changes found in the data: threshold (model configuration, `className` says
+  which class), backend (runtime), classes (output space). A hard break must be confirmed with the line owner before
   any statistical conclusion; it usually explains everything that changed after it.
 - `flags` and `preVerdict` are deterministic rule outputs computed from the thresholds listed in `config`.
 

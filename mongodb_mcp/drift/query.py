@@ -10,15 +10,15 @@ Row shape after the pipeline (one row per period and entry):
     period level (read from the "total" row): endDate, documentCount, missingBlockCount, tasks, productIds, gbms,
         processes, modes, equipmentIdSets, classSets, bins, inspectionCount, predictionCount, boxCount,
         boxCountPresent, missingConfidenceCount, parseErrorCount, elapsedCount, elapsedSum, imagesPresent,
-        noBoxCount, boxesPerImageSum, boxesPerImageSumSq, boxesPerImageHistogram, backendSets, thresholdSets
+        noBoxCount, boxesPerImageSum, boxesPerImageSumSq, boxesPerImageHistogram, backendSets
     entry level: count, sum, sumSq, min, max, belowThresholdCount, belowPresent, nearThresholdCount, nearPresent,
         histogram, entryThresholds, quantiles, classCount
 
 A document whose equipments[] has no entry for the requested equipment keeps its period alive with
 documentCount 0 and missingBlockCount > 0, so the analysis can report the periods it had to leave out.
 
-The total block carries no backend or threshold, so those come from the equipments[] entries: all of them when the
-total is analysed, the requested one otherwise.
+The total block carries no backend, so the backends come from the equipments[] entries: all of them when the total
+is analysed, the requested one otherwise. Thresholds are per predicted class inside perClass for both tasks.
 """
 from typing import Any
 from datetime import datetime
@@ -178,7 +178,6 @@ class StatisticsQuery:
             "boxesPerImageSumSq": {"$sum": "$block.images.boxesPerImage.sumSq"},
             "boxesPerImageHistograms": {"$push": "$block.images.boxesPerImage.histogram"},
             "backendSets": {"$addToSet": _if_block("$configBackends")},
-            "thresholdSets": {"$addToSet": _if_block("$configThresholds")},
             "count": {"$sum": "$entries.v.count"},
             "sum": {"$sum": "$entries.v.sum"},
             "sumSq": {"$sum": "$entries.v.sumSq"},
@@ -209,16 +208,13 @@ class StatisticsQuery:
                     "bins": 1,
                     "equipmentIds": {"$ifNull": ["$equipments.equipmentId", []]},
                     "equipmentBackends": {"$ifNull": ["$equipments.backend", []]},
-                    "equipmentThresholds": {"$ifNull": ["$equipments.threshold", []]},
                     "block": self.build_block()
                 }
             },
             {
                 "$addFields": {
                     "entries": entries,
-                    "configBackends": "$equipmentBackends" if self.equipment_id is None else ["$block.backend"],
-                    "configThresholds": "$equipmentThresholds" if self.equipment_id is None
-                    else ["$block.threshold"]
+                    "configBackends": "$equipmentBackends" if self.equipment_id is None else ["$block.backend"]
                 }
             },
             {"$unwind": "$entries"},

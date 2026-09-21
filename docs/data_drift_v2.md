@@ -52,6 +52,20 @@ Validation, as today through `DriftWindow`: dates UTC-normalised, reference befo
 `max_total_days`. Because a year of daily documents is a few hundred small reads, `max_total_days` can be raised
 from 30 to about 400 with `max_periods` 60 forcing weekly documents for long spans.
 
+**Automatic granularity.** `auto` looks only at the total span of both windows, never at the data volume, and picks
+the finest period type that yields at most `max_periods` periods:
+
+| Total span of both windows | Periods it would produce | Chosen |
+|---|---|---|
+| up to 2.5 days | up to 60 hourly | `hourly` |
+| 2.5 to 30 days | up to 60 shifts of 12 hours | `shift` |
+| 30 to 60 days | up to 60 daily | `daily` |
+| over 60 days | weekly, at most 57 for the 400-day maximum | `weekly` |
+
+The choice is made before the query, so it names the documents that are read; there is no fallback to another
+period type when that granularity was not written. Small periods on a quiet line are reported as insufficient rather
+than merged, and the caller picks a coarser granularity.
+
 ---
 
 ## 3. Flow of one call
@@ -98,7 +112,8 @@ $group    by (startDate, entry kind, class):   one row per period and entry, doc
             perClass[c].count / sum / sumSq / histogram / below / near   same, keyed by class
             images.noBoxCount, images.boxesPerImage.sum/sumSq/histogram   $sum / element-wise
             elapsedTime.count / sum                                 $sum
-            backends, thresholds, classLists, binsSeen              $addToSet
+            backends, classLists, binsSeen                          $addToSet
+            perClass[c].threshold                                   $addToSet, per class
             quality.*                                               $sum
             quantiles                                               $first, kept only when documentCount == 1
 $sort     startDate
@@ -114,8 +129,9 @@ periods is well under 1 MB regardless of how many barcodes contributed.
 **Bins.** Every document carries `bins`. Periods whose `bins.confidenceEdges` differ cannot be compared; the tool
 reports `INCOMPATIBLE_BINS`, keeps the series, sets the crossing consecutive confidence PSI to null and runs no split.
 
-**Backend and threshold.** The `total` block carries neither, so the pipeline collects them from `equipments[]`:
-every entry when the total is analysed, the requested entry otherwise.
+**Backend and threshold.** The `total` block carries no backend, so the pipeline collects the backends from
+`equipments[]`: every entry when the total is analysed, the requested entry otherwise. Thresholds are per predicted
+class inside `perClass` for both tasks and come with the class entries.
 
 ---
 
@@ -142,7 +158,7 @@ Compact fields, one entry per period, reference periods first in comparison mode
 | `belowThresholdRate`, `nearThresholdRate` | `count / confidence.count`, null when the threshold counts are null |
 | `meanBoxesPerImage`, `noBoxRate` | det only |
 | `meanElapsedTime` | `elapsedTime.sum / count` |
-| `backends`, `thresholds`, `thresholdsByClass` | the sets seen; a set with more than one element is itself a hard break inside the period |
+| `backends`, `thresholdsByClass` | the sets seen; a set with more than one element is itself a hard break inside the period |
 
 Full detail adds `confidenceHistogram` (proportions), `confidenceQuantiles` (when exact), and `perClass` with
 `count`, `share`, `meanConfidence`, `belowThresholdRate`, `histogram`.
@@ -177,7 +193,7 @@ The chosen split reports:
 
 ### 5.5 Hard breaks
 
-Consecutive periods compared on `backend`, `threshold` (per class for det) and `classes`. A period whose own set has
+Consecutive periods compared on `backend`, `threshold` (per predicted class) and `classes`. A period whose own set has
 more than one value is also a break, dated at that period. Entries: `kind`, `className`, `date`, `from`, `to`.
 
 ### 5.6 Rules and pre-verdict
@@ -276,7 +292,7 @@ class ClassSummary(DriftModel):                  # one predicted class inside a 
     std_confidence: float | None = None
     below_threshold_rate: float | None = None
     near_threshold_rate: float | None = None
-    threshold: float | None = None               # det only
+    threshold: float | None = None               # threshold of this predicted class
     confidence_histogram: list[float] | None = None   # proportions, full detail only
 
 
@@ -301,8 +317,7 @@ class CompactPeriodSummary(DriftModel):
     no_box_rate: float | None = None             # det only
     mean_elapsed_time: float | None = None
     backends: list[str] = []                     # more than one element is a break inside the period
-    thresholds: list[float] = []                 # cls
-    thresholds_by_class: dict[str, list[float]] = {}   # det
+    thresholds_by_class: dict[str, list[float]] = {}   # per predicted class, both tasks
 
 
 class PeriodSummary(CompactPeriodSummary):
@@ -370,7 +385,7 @@ class SplitResult(DriftModel):                   # change_point (range) or compa
 
 class HardBreak(DriftModel):
     kind: Literal["backend", "threshold", "classes"]
-    class_name: str | None = None                # det threshold breaks
+    class_name: str | None = None                # threshold breaks
     date: datetime                               # start of the period where the new value appears
     from_value: Any = Field(None, alias="from")
     to_value: Any = Field(None, alias="to")
@@ -428,7 +443,7 @@ class DriftAnalysisResult(DriftModel):
      "meanConfidence": 0.981, "stdConfidence": 0.03, "medianConfidence": 0.99, "medianSource": "histogram",
      "belowThresholdRate": 0.001, "nearThresholdRate": 0.004,
      "meanBoxesPerImage": null, "noBoxRate": null, "meanElapsedTime": 0.2,
-     "backends": ["ts"], "thresholds": [0.5], "thresholdsByClass": {}},
+     "backends": ["ts"], "thresholdsByClass": {"OK": [0.5], "NG": [0.5]}},
     "..."
   ],
   "consecutive": [

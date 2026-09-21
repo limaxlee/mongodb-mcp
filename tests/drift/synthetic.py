@@ -103,16 +103,21 @@ def cls_equipment(
     for label, value in zip(labels, values):
         by_class.setdefault(label, []).append(value)
 
+    per_class = {}
+    for name, items in by_class.items():
+        block = confidence_stats(items, threshold, edges)
+        block["threshold"] = threshold
+        per_class[name] = block
+
     return {
         "inspectionCount": max(n // 10, 1),
         "predictionCount": n,
         "backend": backend,
-        "threshold": threshold,
         "quality": {"missingConfidenceCount": 0, "parseErrorCount": 0},
         "elapsedTime": _elapsed(n, elapsed),
         "classCounts": {name: len(items) for name, items in by_class.items()},
         "confidence": confidence_stats(values, threshold, edges),
-        "perClass": {name: confidence_stats(items, threshold, edges) for name, items in by_class.items()}
+        "perClass": per_class
     }
 
 
@@ -158,7 +163,6 @@ def det_equipment(
         "predictionCount": n_images,
         "boxCount": total_boxes,
         "backend": backend,
-        "threshold": None,
         "quality": {"missingConfidenceCount": 0, "parseErrorCount": 0},
         "elapsedTime": _elapsed(n_images, elapsed),
         "images": {
@@ -369,7 +373,7 @@ def _new_group(kind: str, name: str | None, doc: dict[str, Any]) -> dict[str, An
         "inspectionCount": 0, "predictionCount": 0, "boxCount": 0, "boxCountPresent": 0,
         "missingConfidenceCount": 0, "parseErrorCount": 0, "elapsedCount": 0, "elapsedSum": 0.0,
         "imagesPresent": 0, "noBoxCount": 0, "boxesPerImageSum": 0, "boxesPerImageSumSq": 0,
-        "boxesPerImageHistograms": [], "backendSets": [], "thresholdSets": [],
+        "boxesPerImageHistograms": [], "backendSets": [],
         "count": 0, "sum": 0.0, "sumSq": 0.0, "min": None, "max": None,
         "belowThresholdCount": 0, "belowPresent": 0, "nearThresholdCount": 0, "nearPresent": 0,
         "histograms": [], "entryThresholds": [], "quantiles": None, "quantilesSet": False, "classCount": 0
@@ -399,9 +403,8 @@ def aggregate(documents: Sequence[dict[str, Any]], equipment_id: str | None = No
         equipment_ids = [item.get("equipmentId") for item in doc.get("equipments", [])]
         if equipment_id is None:
             backends = [item.get("backend") for item in doc.get("equipments", []) if "backend" in item]
-            thresholds = [item.get("threshold") for item in doc.get("equipments", []) if "threshold" in item]
         else:
-            backends, thresholds = [block.get("backend")], [block.get("threshold")]
+            backends = [block.get("backend")]
 
         entries: list[tuple[str, str | None, dict[str, Any]]] = [("total", None, block.get("confidence") or {})]
         entries.extend(("class", name, value) for name, value in (block.get("perClass") or {}).items())
@@ -440,7 +443,6 @@ def aggregate(documents: Sequence[dict[str, Any]], equipment_id: str | None = No
             group["imagesPresent"] = max(group["imagesPresent"], 1 if block.get("images") is not None else 0)
             group["boxesPerImageHistograms"].append(_get(block, "images.boxesPerImage.histogram"))
             _add_to_set(group["backendSets"], backends if present else None)
-            _add_to_set(group["thresholdSets"], thresholds if present else None)
 
             for field in ("count", "sum", "sumSq", "belowThresholdCount", "nearThresholdCount", "classCount"):
                 item = value.get(field)

@@ -28,7 +28,8 @@ Decisions already taken:
 | `mode` | Statistics are computed for every mode; `mode` is part of the document key next to model name and version |
 | `location` | Lives inside each `equipments[]` entry |
 | `classes`, `localTimezone` | Properties of the model version and the site, stored once at document level |
-| `backend`, `threshold` | Scalars per equipment (last value seen in the period); a change is detected between periods, not inside one |
+| `backend` | Scalar per equipment (last value seen in the period); a change is detected between periods, not inside one |
+| `threshold` | Per predicted class, inside `perClass[c]`, for both tasks (last value seen in the period) |
 | Image specs, box geometry | Not stored, not used in the analysis |
 | Time boundaries | Strictly UTC: hour, 00:00 / 12:00 shift, midnight, Monday midnight |
 | Human feedback | Ignored completely |
@@ -103,7 +104,7 @@ Values are illustrative. Comments are not part of the document.
   "computedAt": ISODate("2026-06-20T01:05:12Z"),   // last time this document was (re)computed
   "equipmentCount": 2,
 
-  // ---- sum over every equipment; same shape as one equipment entry minus equipmentId/location/backend/threshold ----
+  // ---- sum over every equipment; same shape as one equipment entry minus equipmentId/location/backend ----
   "total": { ...EquipmentStats },
 
   "equipments": [
@@ -130,7 +131,6 @@ Values are illustrative. Comments are not part of the document.
 
   // ---- runtime configuration, last value seen in the period ----
   "backend": "ts",
-  "threshold": 0.5,                              // cls: prediction.threshold; null when the model has none
 
   // ---- data quality ----
   "quality": {
@@ -147,10 +147,10 @@ Values are illustrative. Comments are not part of the document.
   // ---- confidence over all predictions ----
   "confidence": { ...ConfidenceStats },
 
-  // ---- confidence per predicted class ----
+  // ---- confidence per predicted class, with the threshold that applied to that class ----
   "perClass": {
-    "OK": { ...ConfidenceStats },
-    "NG": { ...ConfidenceStats }
+    "OK": { "threshold": 0.5, ...ConfidenceStats },
+    "NG": { "threshold": 0.5, ...ConfidenceStats }
   }
 }
 ```
@@ -173,7 +173,7 @@ combined exactly into a larger window. `mean` and `std` are stored for direct re
   "quantiles": { "p05": 0.88, "p10": 0.91, "p25": 0.95, "p50": 0.975, "p75": 0.99, "p90": 0.995, "p95": 0.998 },
   "histogram": [0, 0, 0, 0, 0, 3, 12, 41, 210, 1924],   // counts per bin of bins.confidenceEdges
 
-  // threshold relation; null when the equipment (cls) or the class (det) has no threshold
+  // threshold relation; null when the class has no threshold
   "belowThresholdCount": 3,                       // confidence < threshold, rate = belowThresholdCount / count
   "nearThresholdCount": 15                        // |confidence - threshold| < bins.nearThresholdMargin
 }
@@ -191,7 +191,6 @@ is not stored and not used in the analysis.
   "boxCount": 2955,                               // boxes over all images
 
   "backend": "trt",
-  "threshold": null,                              // det: thresholds are per box class, see perClass[c].threshold
 
   // ---- image level ----
   "images": {
@@ -225,7 +224,7 @@ is not stored and not used in the analysis.
 | `confidenceHistogram` (proportions) | `confidence.histogram` (counts) |
 | `belowThresholdRate`, `nearThresholdRate` | `belowThresholdCount / count`, same for near |
 | `meanBoxesPerImage`, `stdBoxesPerImage`, `noBoxRate`, `boxesPerImageHistogram`, `boxesByClassPerImage` | `images.*` |
-| `thresholdValues`, backend, classes (hard breaks) | `threshold`, `backend` per equipment, `classes` per document; compared between consecutive periods |
+| `thresholdValues`, backend, classes (hard breaks) | `perClass[c].threshold`, `backend` per equipment, `classes` per document; compared between consecutive periods |
 | `imageSpecs` (image_spec hard break) | Not stored (open point 4) |
 | `medianElapsedTime` | `elapsedTime` |
 | `missingConfidenceCount`, `parseErrorCount` | `quality.*` |
@@ -279,9 +278,9 @@ Everything above is arithmetic over at most a few hundred numbers per period and
 1. **Quantiles per class.** The proposal stores the full `p05...p95` set in every `ConfidenceStats`. If document
    size matters for detection models with many classes, keep the full set only in `confidence` and `p10/p50/p90`
    in `perClass`.
-2. **Threshold placement.** `threshold` is a float at equipment level for `cls` and a float inside each
-   `perClass[c]` block for `det`, because detection thresholds are per box class. If one shape is preferred, put
-   `threshold` inside `perClass` for both tasks and drop the equipment-level field.
+2. **Threshold placement (decided).** `threshold` is a float inside each `perClass[c]` block for both tasks: the
+   threshold of the predicted class for `cls`, the threshold of the box class for `det`. There is no equipment-level
+   threshold, so a classification model with different thresholds per class is represented without ambiguity.
 3. **Rollups.** With `sum`, `sumSq`, `histogram` and every count additive, daily, shift and weekly documents are an
    exact sum of hourly documents except for `quantiles`, `min`, `max` and `std`, which are also derivable
    (min/max by union, std from sums, quantiles from the raw data). Whether the Data Service builds the coarser
@@ -393,7 +392,7 @@ class ConfidenceStats(ValueStats):
     histogram: list[NonNegativeInt] = []               # len == len(bins.confidenceEdges) - 1
     belowThresholdCount: NonNegativeInt | None = None  # None when no threshold applies
     nearThresholdCount: NonNegativeInt | None = None
-    threshold: float | None = None                     # det only, per box class
+    threshold: float | None = None                     # threshold of this predicted class, both tasks
 
 
 class ElapsedTimeStats(BaseModel):
@@ -442,7 +441,6 @@ class EquipmentEntry(EquipmentStats):
     equipmentId: str
     location: str
     backend: str | None = None                         # last value seen in the period
-    threshold: float | None = None                     # cls only; det thresholds live in perClass[c].threshold
 
 
 class Bins(BaseModel):

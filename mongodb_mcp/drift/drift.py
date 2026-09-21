@@ -189,13 +189,10 @@ class DriftAnalyzer:
                 (HardBreakKind.BACKEND, None, self._single_or_list(period.backends)),
                 (HardBreakKind.CLASSES, None, list(period.classes) or None)
             ]
-            if self.summarizer.detection:
-                observed.extend(
-                    (HardBreakKind.THRESHOLD, name, self._single_or_list(counts.thresholds))
-                    for name, counts in period.per_class.items()
-                )
-            else:
-                observed.append((HardBreakKind.THRESHOLD, None, self._single_or_list(period.thresholds)))
+            observed.extend(
+                (HardBreakKind.THRESHOLD, name, self._single_or_list(counts.thresholds))
+                for name, counts in period.per_class.items()
+            )
 
             for kind, class_name, value in observed:
                 if value is None:

@@ -111,9 +111,6 @@ def _fill_period(period: PeriodCounts, row: dict[str, Any]) -> None:
     period.boxes_per_image_sum_sq = _int(row.get("boxesPerImageSumSq"))
     period.boxes_per_image_histogram = [_int(value) for value in row.get("boxesPerImageHistogram") or []]
     period.backends = sorted(str(item) for item in _flatten(row.get("backendSets")))
-    period.thresholds = sorted(
-        value for value in _flatten(row.get("thresholdSets")) if isinstance(value, (int, float))
-    )
     period.confidence = _confidence_counts(row)
 
 
@@ -240,7 +237,6 @@ class PeriodSummarizer:
             no_box_rate=no_box_rate,
             mean_elapsed_time=period.elapsed_sum / period.elapsed_count if period.elapsed_count > 0 else None,
             backends=list(period.backends),
-            thresholds=list(period.thresholds),
             thresholds_by_class={
                 name: list(counts.thresholds) for name, counts in period.per_class.items() if counts.thresholds
             },

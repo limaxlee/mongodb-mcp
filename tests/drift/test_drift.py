@@ -197,13 +197,14 @@ class TestHardBreaks:
             confidences=(0.93,) * 6,
             stats_kwargs_for_period=lambda i: {"backend": "ts" if i < 2 else "trt", "threshold": 0.8 if i < 4 else 0.9}
         )
-        kinds = [(item.kind, item.date, item.from_value, item.to_value) for item in result.hard_breaks]
-        assert (HardBreakKind.BACKEND, START + timedelta(days=2), "ts", "trt") in kinds
-        assert (HardBreakKind.THRESHOLD, START + timedelta(days=4), 0.8, 0.9) in kinds
-        assert len(result.hard_breaks) == 2
+        kinds = [(item.kind, item.class_name, item.date, item.from_value, item.to_value) for item in result.hard_breaks]
+        assert (HardBreakKind.BACKEND, None, START + timedelta(days=2), "ts", "trt") in kinds
+        assert (HardBreakKind.THRESHOLD, "Good", START + timedelta(days=4), 0.8, 0.9) in kinds
+        assert (HardBreakKind.THRESHOLD, "NG", START + timedelta(days=4), 0.8, 0.9) in kinds
+        assert len(result.hard_breaks) == 3
         assert DriftFlag.HARD_BREAK in result.flags and result.pre_verdict == PreVerdict.SUSPICIOUS
 
-    def test_detection_threshold_break_carries_the_class(self):
+    def test_threshold_break_carries_the_class(self):
         result = analyse(
             task="det", confidences=(0.9,) * 4, n=400,
             stats_kwargs_for_period=lambda i: {"threshold": 0.8 if i < 2 else 0.7}

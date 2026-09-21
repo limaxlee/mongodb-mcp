@@ -48,7 +48,7 @@ Drift analysis does not need "every single prediction"; it needs **"the distribu
 | Threshold counts | predictions with confidence below the threshold, and predictions near the threshold (±0.05) |
 | Boxes per image (det) | histogram of how many images had 0, 1, 2, ... boxes, and the number of images without a box |
 | Inference time | count and sum of elapsed time |
-| Runtime configuration | backend and threshold values (to detect configuration changes) |
+| Runtime configuration | backend, and the threshold of each class (to detect configuration changes) |
 | Quality | predictions with a missing confidence or a parse failure |
 
 **Why the confidence histogram is the key item.** Put the histograms of two periods side by side and "the model is less sure than it used to be" shows up directly as counts moving between bins. And because histograms are additive, the exact distribution of any combination of periods can be rebuilt. Storing only an average would make this comparison impossible.
@@ -82,7 +82,6 @@ Drift analysis does not need "every single prediction"; it needs **"the distribu
       "equipmentId": "SEHC_Side_VM07",
       "location": "VM07",
       "backend": "ts",
-      "threshold": 0.5,
       "inspectionCount": 118,
       "predictionCount": 2360,
       "quality": { "missingConfidenceCount": 0, "parseErrorCount": 0 },
@@ -97,8 +96,8 @@ Drift analysis does not need "every single prediction"; it needs **"the distribu
         "nearThresholdCount": 15
       },
       "perClass": {
-        "OK": { "...same structure as confidence, only predictions predicted as OK..." },
-        "NG": { "...only predictions predicted as NG..." }
+        "OK": { "threshold": 0.5, "...same structure as confidence, only predictions predicted as OK..." },
+        "NG": { "threshold": 0.5, "...only predictions predicted as NG..." }
       }
     },
     { "equipmentId": "SEHC_Side_VM08", "location": "VM08", "..." : "..." }
@@ -107,7 +106,7 @@ Drift analysis does not need "every single prediction"; it needs **"the distribu
 ```
 
 - `bins` defines the histogram bins. The analysis tool reads them from the document, so the bins can be changed later without touching the tool. Documents with different bins are never compared with each other.
-- For detection models `confidence`, `classCounts` and `perClass` are over bounding boxes, and `boxCount` plus an `images` block (histogram of boxes per image, number of images without a box) are added. The threshold is per class inside `perClass`.
+- For detection models `confidence`, `classCounts` and `perClass` are over bounding boxes, and `boxCount` plus an `images` block (histogram of boxes per image, number of images without a box) are added. For both tasks the threshold is stored per class inside `perClass`.
 - Indexes: one unique index on `(modelName, modelVersion, task, mode, gbm, process, granularity, startDate, productId)` and a TTL index on `startDate` for retention
 
 ### 4. How the drift analysis works
@@ -116,7 +115,7 @@ The new tool reads statistics documents only and does **nothing beyond additions
 
 **(1) When did it change — the period series and consecutive comparison**
 
-The requested range is listed period by period (for example the last 30 days, one day each) with the mean confidence, class ratio, below-threshold rate and so on of each period. Next to it comes the **PSI of every period against the period before it**. The day the PSI jumps is the moment of the change.
+The requested range is listed period by period (for example the last 30 days, one day each) with the mean confidence, class ratio, below-threshold rate and so on of each period. The period type can be given explicitly, or left to the tool: it then picks the finest type that keeps the whole range within 60 periods, so a range up to 2.5 days is shown hourly, up to 30 days per shift, up to 60 days daily, and anything longer weekly. Next to it comes the **PSI of every period against the period before it**. The day the PSI jumps is the moment of the change.
 
 **(2) How much did it change — PSI (Population Stability Index)**
 

@@ -104,7 +104,6 @@ class PeriodCounts(BaseModel):
     boxes_per_image_sum_sq: int = 0
     boxes_per_image_histogram: list[int] = []
     backends: list[str] = []
-    thresholds: list[float] = []
     class_counts: dict[str, int] = {}
     confidence: ConfidenceCounts = ConfidenceCounts()
     per_class: dict[str, ConfidenceCounts] = {}
@@ -139,7 +138,6 @@ class PeriodCounts(BaseModel):
             boxes_per_image_sum_sq=self.boxes_per_image_sum_sq + other.boxes_per_image_sum_sq,
             boxes_per_image_histogram=_add_histograms(self.boxes_per_image_histogram, other.boxes_per_image_histogram),
             backends=_union(self.backends, other.backends),
-            thresholds=_union(self.thresholds, other.thresholds),
             class_counts={
                 key: self.class_counts.get(key, 0) + other.class_counts.get(key, 0)
                 for key in _union(list(self.class_counts), list(other.class_counts))
@@ -252,7 +250,6 @@ class CompactPeriodSummary(DriftModel):
     no_box_rate: float | None = None
     mean_elapsed_time: float | None = None
     backends: list[str] = []
-    thresholds: list[float] = []
     thresholds_by_class: dict[str, list[float]] = {}
 
 
