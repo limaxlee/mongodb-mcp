@@ -1,3 +1,8 @@
+> **구버전 안내.** 이 문서는 원본 inspection document를 직접 읽던 이전 구현을 설명합니다. 현재 tool은 사전 집계된
+> `inspectionStatistics` collection을 읽습니다. [DATA_DRIFT.md](../DATA_DRIFT.md)와
+> [inspection_statistics.md](inspection_statistics.md)를 참고하세요. 목적, drift 종류, PSI 해석 기준은 그대로
+> 유효하지만 bucket, KS test, trend, outlier, box geometry, image spec break는 더 이상 존재하지 않습니다.
+
 # [데이터 서비스] 데이터 드리프트 분석 — 동작 원리
 
 **English version:** [data_drift.en.md](data_drift.en.md)

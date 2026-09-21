@@ -57,22 +57,6 @@ class TestDivergence:
         assert stats.js_divergence([0.5, 0.5], [0.5, 0.5]) == pytest.approx(0.0)
         assert 0.99 < stats.js_divergence([1.0, 0.0], [0.0, 1.0]) <= 1.0
 
-    def test_ks_identical_and_separated(self):
-        same = [i / 100 for i in range(100)]
-        d, p = stats.ks_2samp(same, same)
-        assert d == 0.0 and p == pytest.approx(1.0)
-
-        d, p = stats.ks_2samp([0.1, 0.2, 0.3] * 50, [0.7, 0.8, 0.9] * 50)
-        assert d == 1.0 and p < 1e-6
-
-        assert stats.ks_2samp([], [1.0]) == (0.0, 1.0)
-
-    def test_ks_same_distribution_has_high_p(self):
-        a = [(i * 37 % 100) / 100 for i in range(200)]
-        b = [(i * 53 % 100) / 100 for i in range(200)]
-        d, p = stats.ks_2samp(a, b)
-        assert d < 0.1 and p > 0.05
-
     def test_chi2_known_table(self):
         stat, p, dof = stats.chi2_contingency([[10, 20], [20, 10]])
         assert stat == pytest.approx(6.6667, abs=1e-3)
@@ -95,38 +79,22 @@ class TestDivergence:
         assert stats.chi2_survival(0.0, 3) == 1.0
 
 
-class TestTrend:
-    def test_kendall_monotonic(self):
-        tau, p = stats.kendall_tau([0, 1, 2, 3, 4, 5], [1.0, 1.1, 1.2, 1.3, 1.4, 1.5])
-        assert tau == pytest.approx(1.0)
-        assert p < 0.05
+class TestHistogramQuantile:
+    def test_median_inside_a_bin(self):
+        # 10 values uniform in [0, 1): the median is halfway through the histogram
+        edges = [0.0, 0.5, 1.0]
+        assert stats.histogram_quantile([5, 5], edges, 0.5) == 0.5
+        assert stats.histogram_quantile([10, 0], edges, 0.5) == 0.25
+        assert stats.histogram_quantile([0, 10], edges, 0.5) == 0.75
 
-        tau, p = stats.kendall_tau(list(range(10)), list(range(10)))
-        assert tau == pytest.approx(1.0)
-        assert p == pytest.approx(8.3e-5, abs=1e-5)
+    def test_quantile_positions(self):
+        edges = [0.0, 0.1, 0.2, 0.3]
+        counts = [1, 1, 2]
+        assert math.isclose(stats.histogram_quantile(counts, edges, 0.25), 0.1)
+        assert math.isclose(stats.histogram_quantile(counts, edges, 0.5), 0.2)
+        assert math.isclose(stats.histogram_quantile(counts, edges, 1.0), 0.3)
 
-    def test_kendall_no_trend(self):
-        tau, p = stats.kendall_tau([0, 1, 2, 3, 4, 5], [1.0, 1.4, 1.1, 1.5, 1.2, 1.3])
-        assert abs(tau) < 0.5
-        assert p > 0.05
-
-    def test_kendall_all_ties(self):
-        assert stats.kendall_tau([0, 1, 2], [1.0, 1.0, 1.0]) == (0.0, 1.0)
-        assert stats.kendall_tau([0], [1.0]) == (0.0, 1.0)
-
-    def test_theil_sen_linear(self):
-        assert stats.theil_sen_slope([1.0, 3.0, 5.0, 7.0]) == pytest.approx(2.0)
-        assert stats.theil_sen_slope([2 * i + (0.1 if i % 2 else -0.1) for i in range(10)]) == pytest.approx(2.0)
-        assert stats.theil_sen_slope([1.0]) == 0.0
-
-    def test_robust_z_flags_outlier(self):
-        scores = stats.robust_z_scores([1.0, 1.1, 0.9, 1.0, 5.0, 1.05, 0.95])
-        assert abs(scores[4]) > 3.5
-        assert all(abs(score) < 3.5 for index, score in enumerate(scores) if index != 4)
-
-    def test_robust_z_zero_mad_fallbacks(self):
-        scores = stats.robust_z_scores([0.0, 0.0, 0.0, 0.0, 0.3, 0.0])
-        assert scores[4] == 99.0
-        assert scores[0] == 0.0
-
-        assert stats.robust_z_scores([1.0, 2.0]) == [None, None]
+    def test_degenerate(self):
+        assert stats.histogram_quantile([], [0.0, 1.0], 0.5) is None
+        assert stats.histogram_quantile([0, 0], [0.0, 0.5, 1.0], 0.5) is None
+        assert stats.histogram_quantile([1, 2, 3], [0.0, 1.0], 0.5) is None

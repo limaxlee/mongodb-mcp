@@ -834,100 +834,102 @@ async def mongodb_analyze_data_drift(
         task: str | None = None,
         gbm: str | None = None,
         process: str | None = None,
-        location: str | None = None,
         equipment_id: str | None = None,
+        product_id: str | None = None,
         mode: str | None = "production",
-        bucket: str = "auto",
+        granularity: str = "auto",
         detail: str = "full",
         reference_start_date: datetime | None = None,
         reference_end_date: datetime | None = None
 ) -> DriftAnalysisResult:
     """Compute the statistics needed to decide whether an inspection model's input data or behaviour drifted
 
-    Works on the raw inspection results of one classification (cls) or object detection (det) model. Segmentation
-    models are not supported. Two modes exist:
-      - Range mode (default): analyses start_date to end_date, splits it into time buckets, searches for the moment
-        the output distribution changed the most (change point), for gradual trends, and for outlier buckets.
-      - Comparison mode: when reference_start_date and reference_end_date are also given, the reference window is compared
-        against the current window at a fixed split instead of searching for one.
-    The windows together may cover at most 30 days. Statistics are computed over every prediction of the model, a
-    document contributes one record per matching aiResults entry and prediction. For detection models the
-    confidence and class statistics are computed over bounding boxes, a list of confidences is reduced to its
-    maximum. Nothing here is a verdict; the flags and pre-verdict are deterministic rules to be confirmed or
-    overruled by reading the statistics.
+    Reads the pre-aggregated inspectionStatistics collection (one document per model, version, task, mode, site,
+    product and period) of one classification (cls) or object detection (det) model, never the raw inspections.
+    Documents of a period are summed inside MongoDB, so any number of products per period costs one row. Every
+    number returned is derived from additive counts: proportions, means, rates, and PSI / JS / chi-square between
+    fixed-bin histograms. Two modes exist:
+      - Range mode (default): analyses start_date to end_date as a series of periods, reports the divergence of
+        every period against the previous one, and searches the split where the output distribution changed most.
+      - Comparison mode: when reference_start_date and reference_end_date are also given, the reference periods are
+        compared against the current periods at that fixed boundary instead of searching for a split.
+    For detection models the confidence and class statistics are over bounding boxes; boxes per image and the no-box
+    rate are over images. Nothing here is a verdict: the flags and pre-verdict are deterministic rules to be
+    confirmed or overruled by reading the statistics.
 
     Args:
-        model_name: Name of the inspection model, matched exactly together with the version as name/version
-        model_version: Version of the inspection model
-        start_date: Start of the analysed (current) window, inclusive, UTC like every date in and out of this tool
-        end_date: End of the analysed (current) window, inclusive
-        task: Task of the model, cls or det, required only when the model string is used for both tasks
-        gbm: Manufacturing site the inspections ran at, exact match
-        process: Process the inspections ran in, exact match
-        location: Location within the process, exact match
-        equipment_id: Id of the equipment the inspections ran on, exact match
-        mode: Operating mode of the inspections, production by default, pass null to include every mode
-        bucket: Time bucket size, auto (default), 1h, 1d or 1w; auto picks by range length and volume
-        detail: full (default) keeps every histogram and quantile per bucket, compact keeps only the scalar series
+        model_name: Name of the inspection model, exact match on the statistics documents
+        model_version: Version of the inspection model, exact match
+        start_date: Start of the analysed (current) window, UTC like every date in and out of this tool; a period
+          belongs to the window when its start lies in [start_date, end_date)
+        end_date: End of the analysed (current) window, exclusive
+        task: Task of the model, cls or det, required only when the model has statistics for both tasks
+        gbm: Manufacturing site, exact match; null sums every site the model ran at
+        process: Process, exact match; null sums every process
+        equipment_id: Id of one equipment; null uses the total over every equipment of the site
+        product_id: Barcode of one product; null sums every product of the period
+        mode: Operating mode of the inspections, production by default, pass null to sum every mode
+        granularity: Period type of the documents to read: auto (default), hourly, shift, daily or weekly; auto
+          picks the finest granularity that keeps both windows within config.maxPeriods periods
+        detail: full (default) keeps histograms, quantiles and per-class blocks per period, compact keeps scalars only
         reference_start_date: Start of the reference window for comparison mode, inclusive
-        reference_end_date: End of the reference window for comparison mode, inclusive, must not be after start_date
+        reference_end_date: End of the reference window for comparison mode, exclusive, must not be after start_date
 
     Returns:
         Drift analysis with the following fields:
-            modelName, modelVersion, task: The analysed model
-            mode: range or comparison
-            filters: The metadata filters that were applied
+            modelName, modelVersion, task: The analysed model, task resolved from the documents when not given
+            mode: The operating mode filter, null when every mode was summed
+            analysisMode: range or comparison
+            filters: gbm, process, equipmentId, productId as applied
+            sitesSeen: Distinct gbms, processes, modes and equipmentIds summed into the analysis
+            granularity: The resolved period type
             range, referenceRange: Analysed windows with startDate, endDate and length in days
-            bucket: The resolved bucket size
-            status: What could be computed, with the following fields:
-                analysisPossible: Whether a change point or comparison was computed
-                changePointRan, comparisonRan, trendRan, outlierRan: Which analyses ran
-                bucketCount: Number of buckets after merging small ones
-            dataQuality: Volume and problems of the scanned data, with the following fields:
-                scannedDocumentCount: Documents matching the filters
-                matchedDocumentCount, matchedEntryCount: Documents and aiResults entries that produced records
-                recordCount: Predictions extracted (images for detection)
-                boxCount: Bounding boxes extracted, detection only
-                analyzedRecordCount, samplingRatio: Predictions kept for the statistics after the record budget
-                  (config.recordBudget, 0 disables it) thinned every bucket evenly in time; equal to recordCount
-                  and 1.0 when the budget did not apply
-                missingConfidenceCount, missingImageSpecCount, parseErrorCount, parseErrorExamples: Skipped or degraded data
-                mergedBuckets: Start times of buckets merged into a neighbour for being too small
+            status: analysisPossible (a split or comparison with sufficient sides), splitRan, comparisonRan,
+              periodCount, referencePeriodCount
+            dataQuality: documentCount (statistics documents read), productCount (distinct products),
+              inspectionCount, predictionCount (images), boxCount (detection), missingConfidenceCount,
+              parseErrorCount, partialPeriods (periods still running), periodsMissingEquipment (equipment_id given
+              but absent in those periods, left out), incompatibleBins (bin edges differ across documents, no
+              divergence computed)
             classes: Every class the model output
-            buckets: Chronological per bucket statistics, each with the following fields:
-                startDate, endDate: UTC boundaries, window: current or reference
-                recordCount: Records in the bucket, mergedFrom: How many raw buckets were merged into it
-                classDistribution: Share of every class
-                medianConfidence, meanConfidence, stdConfidence, confidenceHistogram, confidenceQuantiles: Confidence statistics, confidenceHistogram uses fixed
-                  bins [0,0.1) ... [0.9,1.0] so buckets are comparable
-                belowThresholdRate: Share of predictions below their threshold, thresholdValues: Thresholds seen
-                imageSpecs: Distinct (width, height, channels) seen, medianElapsedTime: Median inference time
-                nearThresholdRate: Classification only
-                boxCount, meanBoxesPerImage, stdBoxesPerImage, boxesPerImageHistogram, noBoxRate, boxesByClassPerImage,
-                  box: Detection only, box holds normalised geometry quantiles and a log10 area histogram
-            changePoint: Range mode, the split with the largest divergence, searched over the buckets that are not
-              outliers so that a transient bucket does not read as a persistent shift, with the following fields:
-                bucketIndex, date: Where the after side starts, score: Sum of PSI values used for the search
-                candidateCount: Split positions the search tried; the p-values below are corrected for that choice
-                beforeCount, afterCount, sidesSufficient: Sample sizes and whether both sides are large enough to trust
-                psiConfidence, jsConfidence, ksConfidence: Confidence divergence (PSI < 0.1 none, 0.1-0.25 moderate, > 0.25 large)
+            bins: confidenceEdges, nearThresholdMargin, boxesPerImageMax as read from the documents; every
+              histogram below is proportions over these bins
+            periods: Chronological per period statistics, reference periods first, each with the following fields:
+                startDate, endDate: UTC boundaries, window: current or reference, partial: endDate in the future
+                documentCount, productCount, inspectionCount, predictionCount, boxCount
+                classDistribution: Share of every class (over boxes for detection)
+                meanConfidence, stdConfidence, medianConfidence, medianSource: exact when the period is a single
+                  document, histogram when interpolated from the histogram of several summed documents
+                belowThresholdRate, nearThresholdRate: Share of predictions below / within the margin of the
+                  threshold, null when the model has no threshold
+                meanBoxesPerImage, noBoxRate: Detection only
+                meanElapsedTime: Mean inference time
+                backends, thresholds, thresholdsByClass: Runtime configuration seen; more than one value inside a
+                  period is a configuration change inside that period
+                confidenceHistogram, confidenceQuantiles, boxesPerImageHistogram, perClass: Full detail only;
+                  perClass holds count, share, meanConfidence, stdConfidence, belowThresholdRate,
+                  nearThresholdRate, threshold and confidenceHistogram per predicted class
+            consecutive: For every period after the first, PSI of its confidence histogram, class mix and boxes per
+              image against the previous period, with sufficient telling whether both periods are large enough; a
+              spike in this series is the moment of a step
+            changePoint: Range mode, the split with the largest PSI sum, with the following fields:
+                periodIndex, date: Where the after side starts, candidateCount: Split positions the search tried;
+                  the chi-square p-value is corrected for that choice
+                beforeCount, afterCount, sidesSufficient: Predictions on each side and whether both are large enough
+                  to trust (otherwise the values are indicative only and no shift flag fires)
+                psiConfidence, jsConfidence: Confidence histogram divergence (PSI < 0.1 none, 0.1-0.25 moderate,
+                  > 0.25 large), psiConfidenceByClass: The same per predicted class, says which class moved
                 psiClass, chi2Class, maxClassProportionChange: Class distribution divergence
-                psiBoxesPerImage, ksNormalizedArea, ksNormalizedCx, ksNormalizedCy: Detection geometry and box count divergence
-                before, after: Summary of each side including its histograms, so the direction of a move is visible
-            secondaryChangePoints: Further splits found on either side of the primary one
+                psiBoxesPerImage: Detection, boxes-per-image histogram divergence
+                meanConfidenceDelta, belowThresholdRateDelta, elapsedTimeRatio: Direction of the move
+                before, after: Summary of each side including its histograms and per-class blocks
             comparison: Comparison mode, reference (before) versus current (after) with the changePoint fields
-            maxPairwise: Largest PSI between any two buckets for confidence and classes, with the pair
-            outlierBuckets: Buckets whose value in a series is far from the others (robust z-score above 3.5)
-            trend: Per series Kendall tau, p-value, Theil-Sen slope per bucket, first and last value, and
-              whether the trend is meaningful; the series are the scalar bucket fields plus class_share_<class>
-              for every class, no class is treated as good or defect
-            hardBreaks: Silent configuration changes: image_spec, threshold, backend, classes, elapsed_time; a
-              detection threshold is tracked per class and the break carries the className
-            flags: Deterministic rule results such as CONFIDENCE_SHIFT, CLASS_SHIFT, BOX_GEOMETRY_SHIFT,
-              THRESHOLD_PRESSURE, TREND_<SERIES>, TREND_CLASS_SHARE, TRANSIENT_OUTLIER, HARD_BREAK,
-              INSUFFICIENT_DATA, INSUFFICIENT_BUCKETS
-            preVerdict: stable, suspicious, drift_likely or undetermined, derived from the flags; trends count per
-              family (confidence, class share, box count, box geometry), not per series
+            hardBreaks: Configuration changes between consecutive periods: backend, threshold (per class for
+              detection, with className) or classes, each with date, from and to
+            flags: Deterministic rule results: CONFIDENCE_SHIFT, CONFIDENCE_SHIFT_MODERATE, CLASS_SHIFT,
+              CLASS_SHIFT_MODERATE, BOX_COUNT_SHIFT, THRESHOLD_PRESSURE, HARD_BREAK, INSUFFICIENT_DATA,
+              INSUFFICIENT_PERIODS, INCOMPATIBLE_BINS
+            preVerdict: stable, suspicious, drift_likely or undetermined, derived from the flags
             config: Every threshold used, for reproducibility
     """
     try:
@@ -940,10 +942,10 @@ async def mongodb_analyze_data_drift(
             task=task,
             gbm=gbm,
             process=process,
-            location=location,
             equipment_id=equipment_id,
+            product_id=product_id,
             mode=mode,
-            bucket=bucket,
+            granularity=granularity,
             detail=detail,
             reference_start_date=reference_start_date,
             reference_end_date=reference_end_date

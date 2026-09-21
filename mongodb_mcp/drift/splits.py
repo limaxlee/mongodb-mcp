@@ -2,126 +2,160 @@ from typing import Any, Sequence
 from datetime import datetime
 
 from common.config import SETTINGS
-from common.constants import BoxGeometry
 from mongodb_mcp.utils import stats
-from mongodb_mcp.schemas import Record, Bucket, SideCounts
-from mongodb_mcp.drift.summaries import Summarizer
+from mongodb_mcp.schemas import ConfidenceCounts, PeriodCounts
+from mongodb_mcp.drift.period import PeriodSummarizer, sum_periods
 
 
 class SplitFinder:
-    def __init__(self, summarizer: Summarizer):
+    """Divergence between two groups of periods, and the search for the split that maximises it"""
+
+    def __init__(self, summarizer: PeriodSummarizer):
         self.config = SETTINGS.data_drift
         self.summarizer = summarizer
         self.detection = summarizer.detection
-        self.min_side_records = SETTINGS.data_drift.min_side_records_det if self.detection \
-            else SETTINGS.data_drift.min_side_records_cls
+        self.min_side_records = self.config.min_side_records_det if self.detection \
+            else self.config.min_side_records_cls
 
-    def sides_sufficient(self, before: SideCounts, after: SideCounts) -> bool:
-        if before.record_count < self.min_side_records or after.record_count < self.min_side_records:
+    def sides_sufficient(self, before: PeriodCounts, after: PeriodCounts) -> bool:
+        if before.prediction_count < self.min_side_records or after.prediction_count < self.min_side_records:
             return False
-        if self.detection and (before.box_count < self.config.min_side_boxes or after.box_count < self.config.min_side_boxes):
+        if self.detection and ((before.box_count or 0) < self.config.min_side_boxes
+                               or (after.box_count or 0) < self.config.min_side_boxes):
             return False
         return True
 
-    def score(self, before: SideCounts, after: SideCounts) -> float:
-        eps = self.config.eps
-        score = stats.psi(stats.proportions(before.confidence_counts), stats.proportions(after.confidence_counts), eps)
-        keys = sorted(set(before.class_counts) | set(after.class_counts))
-        score += stats.psi(
-            stats.proportions([before.class_counts.get(key, 0) for key in keys]),
-            stats.proportions([after.class_counts.get(key, 0) for key in keys]),
-            eps
+    @staticmethod
+    def comparable(before: ConfidenceCounts, after: ConfidenceCounts) -> bool:
+        return bool(before.histogram) and bool(after.histogram) \
+            and len(before.histogram) == len(after.histogram) \
+            and sum(before.histogram) > 0 and sum(after.histogram) > 0
+
+    def psi_confidence(self, before: ConfidenceCounts, after: ConfidenceCounts) -> float | None:
+        if not self.comparable(before, after):
+            return None
+        return stats.psi(stats.proportions(before.histogram), stats.proportions(after.histogram), self.config.eps)
+
+    def js_confidence(self, before: ConfidenceCounts, after: ConfidenceCounts) -> float | None:
+        if not self.comparable(before, after):
+            return None
+        return stats.js_divergence(
+            stats.proportions(before.histogram), stats.proportions(after.histogram), self.config.eps
         )
-        if self.detection:
-            score += stats.psi(
-                stats.proportions(before.boxes_per_image_counts), stats.proportions(after.boxes_per_image_counts), eps
-            )
-        return score
 
     @staticmethod
-    def _ks(before: Sequence[float], after: Sequence[float]) -> dict[str, Any] | None:
-        if not before or not after:
+    def class_table(before: PeriodCounts, after: PeriodCounts) -> tuple[list[str], list[int], list[int]]:
+        keys = list(before.class_counts)
+        keys.extend(key for key in after.class_counts if key not in keys)
+        return keys, [before.class_counts.get(key, 0) for key in keys], [after.class_counts.get(key, 0) for key in keys]
+
+    def psi_class(self, before: PeriodCounts, after: PeriodCounts) -> float | None:
+        _, before_class, after_class = self.class_table(before, after)
+        if sum(before_class) <= 0 or sum(after_class) <= 0:
             return None
-        d, p = stats.ks_2samp(before, after)
-        return {"d": d, "p": p, "before_count": len(before), "after_count": len(after)}
+        return stats.psi(stats.proportions(before_class), stats.proportions(after_class), self.config.eps)
+
+    def psi_boxes_per_image(self, before: PeriodCounts, after: PeriodCounts) -> float | None:
+        if not self.detection:
+            return None
+        before_hist, after_hist = before.boxes_per_image_histogram, after.boxes_per_image_histogram
+        if not before_hist or not after_hist or len(before_hist) != len(after_hist) \
+                or sum(before_hist) <= 0 or sum(after_hist) <= 0:
+            return None
+        return stats.psi(stats.proportions(before_hist), stats.proportions(after_hist), self.config.eps)
+
+    def score(self, before: PeriodCounts, after: PeriodCounts) -> float:
+        values = [
+            self.psi_confidence(before.confidence, after.confidence),
+            self.psi_class(before, after),
+            self.psi_boxes_per_image(before, after)
+        ]
+        return sum(value for value in values if value is not None)
 
     def compare(
             self,
-            before: Sequence[Record],
-            after: Sequence[Record],
+            before_periods: Sequence[PeriodCounts],
+            after_periods: Sequence[PeriodCounts],
             date: datetime,
-            bucket_index: int | None = None,
+            period_index: int | None = None,
             candidate_count: int = 1
     ) -> dict[str, Any]:
-        eps = self.config.eps
         summarizer = self.summarizer
-        before_counts = summarizer.side_counts(before)
-        after_counts = summarizer.side_counts(after)
+        before = sum_periods(before_periods)
+        after = sum_periods(after_periods)
 
-        before_hist = stats.proportions(before_counts.confidence_counts)
-        after_hist = stats.proportions(after_counts.confidence_counts)
+        keys, before_class, after_class = self.class_table(before, after)
+        chi2_class = None
+        max_prop_change = None
+        if sum(before_class) > 0 and sum(after_class) > 0:
+            chi2_stat, chi2_p, dof = stats.chi2_contingency([before_class, after_class])
+            chi2_class = {"stat": chi2_stat, "p": min(chi2_p * candidate_count, 1.0), "dof": dof}
+            before_dist = summarizer.class_distribution(dict(zip(keys, before_class)))
+            after_dist = summarizer.class_distribution(dict(zip(keys, after_class)))
+            max_prop_change = max((abs(before_dist[key] - after_dist[key]) for key in keys), default=0.0)
 
-        keys = sorted(set(before_counts.class_counts) | set(after_counts.class_counts))
-        before_class = [before_counts.class_counts.get(key, 0) for key in keys]
-        after_class = [after_counts.class_counts.get(key, 0) for key in keys]
-        chi2_stat, chi2_p, dof = stats.chi2_contingency([before_class, after_class])
-        before_dist = summarizer.class_distribution(dict(zip(keys, before_class)))
-        after_dist = summarizer.class_distribution(dict(zip(keys, after_class)))
-        max_prop_change = max((abs(before_dist[key] - after_dist[key]) for key in keys), default=0.0)
+        class_names = list(before.per_class)
+        class_names.extend(name for name in after.per_class if name not in class_names)
 
-        report: dict[str, Any] = {
-            "bucket_index": bucket_index,
+        before_side = summarizer.side(before, len(before_periods))
+        after_side = summarizer.side(after, len(after_periods))
+
+        return {
+            "period_index": period_index,
             "date": date,
             "candidate_count": candidate_count,
-            "score": self.score(before_counts, after_counts),
-            "before_count": before_counts.record_count,
-            "after_count": after_counts.record_count,
-            "sides_sufficient": self.sides_sufficient(before_counts, after_counts),
-            "psi_confidence": stats.psi(before_hist, after_hist, eps),
-            "js_confidence": stats.js_divergence(before_hist, after_hist, eps),
-            "ks_confidence": self._ks(summarizer.confidences(before), summarizer.confidences(after))
-            or {"d": 0.0, "p": 1.0, "before_count": 0, "after_count": 0},
-            "psi_class": stats.psi(stats.proportions(before_class), stats.proportions(after_class), eps),
-            "chi2_class": {"stat": chi2_stat, "p": chi2_p, "dof": dof},
+            "score": self.score(before, after),
+            "before_count": before.prediction_count,
+            "after_count": after.prediction_count,
+            "sides_sufficient": self.sides_sufficient(before, after),
+            "psi_confidence": self.psi_confidence(before.confidence, after.confidence),
+            "js_confidence": self.js_confidence(before.confidence, after.confidence),
+            "psi_confidence_by_class": {
+                name: self.psi_confidence(
+                    before.per_class.get(name, ConfidenceCounts()), after.per_class.get(name, ConfidenceCounts())
+                )
+                for name in class_names
+            },
+            "psi_class": self.psi_class(before, after),
+            "chi2_class": chi2_class,
             "max_class_proportion_change": max_prop_change,
-            "before": summarizer.side(before),
-            "after": summarizer.side(after)
+            "psi_boxes_per_image": self.psi_boxes_per_image(before, after),
+            "mean_confidence_delta": self._delta(before_side.mean_confidence, after_side.mean_confidence),
+            "below_threshold_rate_delta": self._delta(
+                before_side.below_threshold_rate, after_side.below_threshold_rate
+            ),
+            "elapsed_time_ratio": self._ratio(before_side.mean_elapsed_time, after_side.mean_elapsed_time),
+            "before": before_side,
+            "after": after_side
         }
 
-        if self.detection:
-            report["psi_boxes_per_image"] = stats.psi(
-                stats.proportions(before_counts.boxes_per_image_counts),
-                stats.proportions(after_counts.boxes_per_image_counts),
-                eps
-            )
-            for measure in BoxGeometry:
-                report[f"ks_{measure}"] = self._ks(
-                    summarizer.geometry(before, measure), summarizer.geometry(after, measure)
-                )
+    @staticmethod
+    def _delta(before: float | None, after: float | None) -> float | None:
+        if before is None or after is None:
+            return None
+        return after - before
 
-        if candidate_count > 1:
-            for key in ["ks_confidence", "chi2_class"] + [f"ks_{measure}" for measure in BoxGeometry]:
-                test = report.get(key)
-                if test:
-                    test["p"] = min(test["p"] * candidate_count, 1.0)
+    @staticmethod
+    def _ratio(before: float | None, after: float | None) -> float | None:
+        if not before or after is None:
+            return None
+        return after / before
 
-        return report
+    def candidate_count(self, period_count: int) -> int:
+        return max(period_count - 2 * self.config.min_segment_periods + 1, 1)
 
-    def candidate_count(self, bucket_count: int) -> int:
-        return max(bucket_count - 2 * self.config.min_segment_buckets + 1, 1)
-
-    def best_split(self, counts: Sequence[SideCounts]) -> int | None:
-        total = len(counts)
-        min_seg = self.config.min_segment_buckets
+    def best_split(self, periods: Sequence[PeriodCounts]) -> int | None:
+        """Index of the first "after" period of the split with the largest PSI sum, sufficient sides preferred"""
+        total = len(periods)
+        min_seg = self.config.min_segment_periods
         if total < 2 * min_seg:
             return None
 
-        prefix: list[SideCounts] = []
-        running = SideCounts()
-        for item in counts:
-            running = running + item
+        prefix: list[PeriodCounts] = []
+        running: PeriodCounts | None = None
+        for item in periods:
+            running = item if running is None else running + item
             prefix.append(running)
-        grand_total = prefix[-1]
 
         best_sufficient: int | None = None
         best_sufficient_score = 0.0
@@ -129,7 +163,7 @@ class SplitFinder:
         best_any_score = 0.0
         for k in range(min_seg, total - min_seg + 1):
             before = prefix[k - 1]
-            after = grand_total - before
+            after = sum_periods(periods[k:])
             score = self.score(before, after)
             if best_any is None or score > best_any_score:
                 best_any, best_any_score = k, score
@@ -138,37 +172,12 @@ class SplitFinder:
 
         return best_sufficient if best_sufficient is not None else best_any
 
-    def primary(self, buckets: Sequence[Bucket], counts: Sequence[SideCounts]) -> dict[str, Any] | None:
-        return self._report(buckets, counts, offset=0)
-
-    def secondary(
-            self,
-            buckets: Sequence[Bucket],
-            counts: Sequence[SideCounts],
-            primary: dict[str, Any]
-    ) -> list[dict[str, Any]]:
-        k = primary["bucket_index"]
-        reports: list[dict[str, Any]] = []
-        for lo, hi in ((0, k), (k, len(buckets))):
-            if hi - lo >= 2 * self.config.min_segment_buckets:
-                report = self._report(buckets[lo:hi], counts[lo:hi], offset=lo)
-                if report is not None and report["sides_sufficient"]:
-                    reports.append(report)
-
-        return reports
-
-    def _report(
-            self,
-            buckets: Sequence[Bucket],
-            counts: Sequence[SideCounts],
-            offset: int
-    ) -> dict[str, Any] | None:
-        k = self.best_split(counts)
+    def primary(self, periods: Sequence[PeriodCounts]) -> dict[str, Any] | None:
+        k = self.best_split(periods)
         if k is None:
             return None
 
-        before = [record for bucket in buckets[:k] for record in bucket.records]
-        after = [record for bucket in buckets[k:] for record in bucket.records]
         return self.compare(
-            before, after, buckets[k].start_date, bucket_index=offset + k, candidate_count=self.candidate_count(len(buckets))
+            periods[:k], periods[k:], periods[k].start_date,
+            period_index=k, candidate_count=self.candidate_count(len(periods))
         )

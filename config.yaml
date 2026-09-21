@@ -5,58 +5,27 @@ mongodb_db_name: cosmoData
 
 # Tunables of the data drift analysis, every value is echoed back in the analysis result
 data_drift:
-  # Range limits
-  max_total_days: 30
-  max_buckets: 60
+  # Range limits: total span of both windows and the number of periods the automatic granularity aims for
+  max_total_days: 400
+  max_periods: 60
 
-  # Maximum records analysed over both windows, buckets are thinned evenly in time to stay within it, 0 disables it
-  record_budget: 15000
-
-  # Minimum records per bucket, used by the automatic bucket choice and for merging small buckets
-  min_bucket_records_cls: 200
-  min_bucket_records_det: 100
-  small_bucket_share: 0.3
-
-  # Minimum records on each side of a split before divergence measures are trusted
+  # Minimum predictions (boxes for detection) on each side of a split before divergence measures are trusted
   min_side_records_cls: 500
   min_side_records_det: 300
   min_side_boxes: 300
 
-  # Minimum number of buckets for each kind of analysis
-  min_buckets_changepoint: 4
-  min_buckets_trend: 6
-  min_segment_buckets: 2
-
-  # Fixed histogram edges, mandatory so that histograms are comparable across buckets
-  confidence_bin_edges: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
-  area_log_bin_edges: [-5.0, -4.0, -3.0, -2.0, -1.0, 0.0]
-  boxes_per_image_max_bin: 5
+  # Minimum number of periods for the change point search and on each side of a split
+  min_periods_changepoint: 4
+  min_segment_periods: 2
 
   # Divergence thresholds
   eps: 0.0001
   psi_moderate: 0.10
   psi_significant: 0.25
-  ks_d_geometry: 0.15
-  ks_p_geometry: 0.01
   chi2_p: 0.001
   class_prop_change: 0.05
   threshold_pressure_ratio: 2.0
   threshold_pressure_abs: 0.02
 
-  # Trend thresholds
-  trend_p: 0.05
-  trend_tau: 0.5
-  trend_value_change: 0.03
-  trend_rate_abs: 0.02
-  trend_rate_rel: 0.5
-  trend_count_rel: 0.2
-
-  # Outlier threshold
-  robust_z: 3.5
-
   # Misc
-  near_threshold_margin: 0.05
-  elapsed_ratio_high: 1.5
-  elapsed_ratio_low: 0.67
   decimals: 4
-  max_parse_error_examples: 10

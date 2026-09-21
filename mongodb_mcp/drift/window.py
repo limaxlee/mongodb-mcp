@@ -1,6 +1,7 @@
 from datetime import datetime
 
 from common.config import SETTINGS
+from common.constants import AUTO_GRANULARITY, Granularity, GRANULARITY_HOURS
 from mongodb_mcp.utils import get_elapsed_days, convert_to_utc_datetime
 from mongodb_mcp.schemas import DateRange
 
@@ -62,3 +63,20 @@ class DriftWindow:
         total_days = self.total_days
         if total_days > SETTINGS.data_drift.max_total_days:
             raise ValueError(f"Drift covers {total_days} days: max time window is {SETTINGS.data_drift.max_total_days}")
+
+    def resolve_granularity(self, requested: str) -> Granularity:
+        """The requested granularity, or for auto the finest one that keeps both windows within max_periods periods"""
+        if requested != AUTO_GRANULARITY:
+            if requested not in list(Granularity):
+                raise ValueError(
+                    f"Unsupported granularity {requested} for drift analysis: "
+                    f"supported values are {AUTO_GRANULARITY}, {', '.join(Granularity)}"
+                )
+            return Granularity(requested)
+
+        total_hours = self.total_days * 24
+        for granularity in Granularity:
+            if total_hours / GRANULARITY_HOURS[granularity] <= SETTINGS.data_drift.max_periods:
+                return granularity
+
+        return Granularity.WEEKLY

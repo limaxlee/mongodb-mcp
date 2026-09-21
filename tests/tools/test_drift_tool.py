@@ -19,14 +19,16 @@ class TestAnalyzeDataDriftTool:
     @pytest.mark.asyncio
     async def test_tool_returns_analysis(self, mocker, drift_tool, mock_context):
         connector = mock_context.request_context.lifespan_context.connector
-        connector._mock_db.list_collection_names = mocker.AsyncMock(return_value=[DBCollections.INSPECTIONS])
+        connector._mock_db.list_collection_names = mocker.AsyncMock(
+            return_value=[DBCollections.INSPECTIONS_STATISTICS]
+        )
 
-        result = await drift_tool(mock_context, "MetalCls", "1.0", START, START + timedelta(days=7))
+        result = await drift_tool(mock_context, "MetalCls", "1.0", START, START + timedelta(days=7), granularity="daily")
 
         assert isinstance(result, DriftAnalysisResult)
         assert result.model_name == "MetalCls"
         assert result.pre_verdict in list(PreVerdict)
-        assert result.detail == "full" and result.mode == "range"
+        assert result.detail == "full" and result.analysis_mode == "range"
 
     @pytest.mark.asyncio
     async def test_tool_passes_arguments_through(self, mocker, drift_tool, mock_context):
@@ -35,15 +37,17 @@ class TestAnalyzeDataDriftTool:
 
         await drift_tool(
             mock_context, "MetalDet", "2.1", START, START + timedelta(days=7),
-            task="det", gbm="SEV", process="SMD", location="Line_01", equipment_id="EQ-01", mode=None,
-            bucket="1d", detail="compact", reference_start_date=START - timedelta(days=7), reference_end_date=START
+            task="det", gbm="SEV", process="SMD", equipment_id="EQ-01", product_id="PR-01", mode=None,
+            granularity="daily", detail="compact", reference_start_date=START - timedelta(days=7),
+            reference_end_date=START
         )
         kwargs = connector.analyze_data_drift.call_args.kwargs
         assert kwargs["model_name"] == "MetalDet" and kwargs["model_version"] == "2.1"
         assert kwargs["start_date"] == START and kwargs["end_date"] == START + timedelta(days=7)
         assert kwargs["task"] == "det" and kwargs["mode"] is None and kwargs["detail"] == "compact"
-        assert kwargs["gbm"] == "SEV" and kwargs["process"] == "SMD" and kwargs["location"] == "Line_01"
-        assert kwargs["equipment_id"] == "EQ-01" and kwargs["bucket"] == "1d"
+        assert kwargs["gbm"] == "SEV" and kwargs["process"] == "SMD"
+        assert kwargs["equipment_id"] == "EQ-01" and kwargs["product_id"] == "PR-01"
+        assert kwargs["granularity"] == "daily"
         assert kwargs["reference_start_date"] == START - timedelta(days=7)
         assert kwargs["reference_end_date"] == START
 
@@ -54,8 +58,9 @@ class TestAnalyzeDataDriftTool:
 
         await drift_tool(mock_context, "MetalCls", "1.0", START, START + timedelta(days=7))
         kwargs = connector.analyze_data_drift.call_args.kwargs
-        assert kwargs["mode"] == "production" and kwargs["bucket"] == "auto" and kwargs["detail"] == "full"
+        assert kwargs["mode"] == "production" and kwargs["granularity"] == "auto" and kwargs["detail"] == "full"
         assert kwargs["task"] is None and kwargs["reference_start_date"] is None
+        assert kwargs["equipment_id"] is None and kwargs["product_id"] is None
 
     @pytest.mark.asyncio
     async def test_tool_wraps_errors(self, mocker, drift_tool, mock_context):

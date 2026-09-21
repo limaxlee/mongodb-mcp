@@ -9,12 +9,12 @@ from pymongo.errors import ConnectionFailure
 
 from common.config import SETTINGS
 from common.constants import (
-    LIMIT, CONNECTION_RETRIES, CONNECTION_DELAY, DBCollections, AUTO_BUCKET,
-    BucketSize, DriftDetail, DriftWindowMode, ModelTasks
+    LIMIT, CONNECTION_RETRIES, CONNECTION_DELAY, DBCollections, AUTO_GRANULARITY,
+    DriftDetail, DriftWindowMode, DriftTask
 )
 from mongodb_mcp.utils import preprocess_operation, process_query_result, generate_normalized_regex
 from mongodb_mcp.schemas import *
-from mongodb_mcp.drift import DriftAnalyzer, DriftQueryBuilder, DriftWindow, RecordExtractor
+from mongodb_mcp.drift import DriftAnalyzer, StatisticsQuery, DriftWindow, build_periods
 
 logger = logging.getLogger(__name__)
 
@@ -535,29 +535,26 @@ class MongoDBConnector:
             task: str | None = None,
             gbm: str | None = None,
             process: str | None = None,
-            location: str | None = None,
             equipment_id: str | None = None,
+            product_id: str | None = None,
             mode: str | None = None,
-            bucket: str = AUTO_BUCKET,
+            granularity: str = AUTO_GRANULARITY,
             detail: str = DriftDetail.FULL,
             reference_start_date: datetime | None = None,
             reference_end_date: datetime | None = None
     ) -> DriftAnalysisResult:
         try:
-            if task is not None and task == ModelTasks.SEGMENTATION:
+            if task is not None and task not in list(DriftTask):
                 raise ValueError(f"Unsupported task {task} for drift analysis: supported tasks are cls and det")
-            if bucket != AUTO_BUCKET and bucket not in list(BucketSize):
-                raise ValueError(f"Unsupported bucket {bucket} for drift analysis: supported buckets are 1h, 1d, 1w")
             if detail not in list(DriftDetail):
                 raise ValueError(f"Unsupported detail {detail} for drift analysis: supported details are full, compact")
 
-            if DBCollections.INSPECTIONS not in await self._db.list_collection_names():
-                raise ValueError(f"Collection {DBCollections.INSPECTIONS} doesn't exist")
+            if DBCollections.INSPECTIONS_STATISTICS not in await self._db.list_collection_names():
+                raise ValueError(f"Collection {DBCollections.INSPECTIONS_STATISTICS} doesn't exist")
 
             model = f"{model_name}/{model_version}"
-            filters = {"gbm": gbm, "process": process, "location": location, "equipment_id": equipment_id, "mode": mode}
+            filters = DriftFilters(gbm=gbm, process=process, equipment_id=equipment_id, product_id=product_id)
 
-            extractor = RecordExtractor(task=task)
             drift_window = DriftWindow(
                 start_date=start_date,
                 end_date=end_date,
@@ -565,72 +562,75 @@ class MongoDBConnector:
                 reference_end_date=reference_end_date
             )
             drift_window.validate()
-            if drift_window.comparison:
-                await self._extract_inspection_records_for_drift(
-                    extractor=extractor,
-                    window_mode=DriftWindowMode.REFERENCE,
-                    start_date=drift_window.reference_start_date,
-                    end_date=drift_window.reference_end_date,
-                    model=model,
-                    task=task,
-                    filters=filters
-                )
-            await self._extract_inspection_records_for_drift(
-                extractor=extractor,
-                window_mode=DriftWindowMode.CURRENT,
-                start_date=drift_window.start_date,
-                end_date=drift_window.end_date,
-                model=model,
-                task=task,
-                filters=filters
-            )
+            resolved_granularity = drift_window.resolve_granularity(granularity)
 
-            if not extractor.records:
-                raise ValueError(f"No inspection results found for model {model} in the requested time window")
+            periods: list[PeriodCounts] = []
+            windows = [(DriftWindowMode.CURRENT, drift_window.start_date, drift_window.end_date)]
+            if drift_window.comparison:
+                windows.insert(
+                    0, (DriftWindowMode.REFERENCE, drift_window.reference_start_date, drift_window.reference_end_date)
+                )
+            for window_mode, window_start, window_end in windows:
+                query = StatisticsQuery(
+                    model_name=model_name,
+                    model_version=model_version,
+                    start_date=window_start,
+                    end_date=window_end,
+                    granularity=resolved_granularity,
+                    task=task,
+                    gbm=gbm,
+                    process=process,
+                    mode=mode,
+                    equipment_id=equipment_id,
+                    product_id=product_id
+                )
+                periods.extend(await self._read_drift_periods(query, window_mode))
+
+            if not any(period.document_count > 0 for period in periods):
+                raise ValueError(
+                    f"No inspection statistics found for model {model} with granularity {resolved_granularity} "
+                    f"in the requested time window"
+                )
+
+            tasks = sorted({item for period in periods for item in period.tasks})
+            if task is None:
+                if len(tasks) > 1:
+                    raise ValueError(
+                        f"Model {model} has statistics for several tasks {tasks}: pass the task to analyse"
+                    )
+                task = tasks[0]
 
             analyzer = DriftAnalyzer(
                 model_name=model_name,
                 model_version=model_version,
-                task=extractor.get_task(),
-                extractor=extractor,
+                task=task,
+                mode=mode,
+                periods=periods,
                 windows=drift_window,
                 filters=filters,
-                bucket=bucket,
+                granularity=resolved_granularity,
                 detail=detail
             )
             result = await asyncio.get_running_loop().run_in_executor(None, analyzer.run)
-            logger.info(f"Analysed data drift for {model}: analyzed {result.data_quality.record_count} records")
+            logger.info(
+                f"Analysed data drift for {model}: {result.status.period_count} {resolved_granularity} periods, "
+                f"{result.data_quality.prediction_count} predictions"
+            )
 
             return result
         except Exception as e:
             logger.exception(f"Failed to analyse data drift for {model_name}/{model_version}: {str(e)}")
             raise
 
-    async def _extract_inspection_records_for_drift(
-            self,
-            extractor: RecordExtractor,
-            window_mode: DriftWindowMode,
-            start_date: datetime,
-            end_date: datetime,
-            model: str,
-            task: str | None,
-            filters: dict[str, str | None]
-    ) -> None:
-        query_builder = DriftQueryBuilder(
-            model=model,
-            start_date=start_date,
-            end_date=end_date,
-            task=task,
-            filters=filters
+    async def _read_drift_periods(self, query: StatisticsQuery, window_mode: DriftWindowMode) -> list[PeriodCounts]:
+        cursor = self._db[DBCollections.INSPECTIONS_STATISTICS].aggregate(query.build_pipeline(), allowDiskUse=True)
+        rows = [row async for row in cursor]
+        periods = build_periods(rows, window_mode)
+        logger.info(
+            f"Read {len(periods)} {query.granularity} periods of {query.model_name}/{query.model_version} "
+            f"between {query.start_date} and {query.end_date}"
         )
-        query = query_builder.build()
-        extractor.quality.scanned_document_count += await self._db[DBCollections.INSPECTIONS].count_documents(query)
-        print(query)
-        cursor = self._db[DBCollections.INSPECTIONS].aggregate(query_builder.build_pipeline(), allowDiskUse=True)
-        async for item in cursor:
-            extractor.add_record(item, window_mode)
-
-        logger.info(f"Extracted {len(extractor.records)} drift records for {model} between {start_date} and {end_date}")
+        return periods
 
     @ensure_connection
     async def close(self):

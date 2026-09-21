@@ -1,133 +1,138 @@
 from typing import Any, Sequence
+from datetime import datetime, timezone
 
 from common.config import SETTINGS
-from common.constants import AUTO_BUCKET, DriftDetail, DriftMode, DriftWindowMode, HardBreakKind
-from mongodb_mcp.utils import stats
-from mongodb_mcp.schemas import Record, Bucket, DriftAnalysisResult
+from common.constants import DriftDetail, DriftMode, DriftWindowMode, DriftTask, HardBreakKind, Granularity
+from mongodb_mcp.schemas import PeriodCounts, DriftAnalysisResult, DriftFilters
 from mongodb_mcp.drift.window import DriftWindow
-from mongodb_mcp.drift.extractor import RecordExtractor
-from mongodb_mcp.drift.buckets import BucketBuilder
-from mongodb_mcp.drift.summaries import Summarizer
+from mongodb_mcp.drift.period import PeriodSummarizer, sum_periods
 from mongodb_mcp.drift.splits import SplitFinder
-from mongodb_mcp.drift.series import SeriesAnalyzer
 from mongodb_mcp.drift.rules import DriftRules
 
 
 class DriftAnalyzer:
+    """Pure arithmetic over the per-period counts read from the statistics collection"""
+
     def __init__(
             self,
             model_name: str,
             model_version: str,
             task: str,
-            extractor: RecordExtractor,
+            mode: str | None,
+            periods: Sequence[PeriodCounts],
             windows: DriftWindow,
-            filters: dict[str, str | None],
-            bucket: str = AUTO_BUCKET,
+            filters: DriftFilters,
+            granularity: Granularity,
             detail: str = DriftDetail.FULL
     ):
         self.config = SETTINGS.data_drift
         self.model_name = model_name
         self.model_version = model_version
-        self.task = task
-        self.extractor = extractor
+        self.task = DriftTask(task)
+        self.mode = mode
         self.windows = windows
         self.filters = filters
-        self.requested_bucket = bucket
+        self.granularity = granularity
         self.detail = DriftDetail(detail)
 
-        self.records = sorted(extractor.records, key=lambda item: item.created_at)
-        self.current = [record for record in self.records if record.window == DriftWindowMode.CURRENT]
-        self.reference = [record for record in self.records if record.window == DriftWindowMode.REFERENCE]
+        ordered = sorted(periods, key=lambda item: (item.window != DriftWindowMode.REFERENCE, item.start_date))
+        self.missing_equipment = [item.start_date for item in ordered if item.document_count == 0]
+        self.periods = [item for item in ordered if item.document_count > 0]
+        self.current = [item for item in self.periods if item.window == DriftWindowMode.CURRENT]
+        self.reference = [item for item in self.periods if item.window == DriftWindowMode.REFERENCE]
 
-        self.summarizer = Summarizer(task, extractor.classes)
-        self.builder = BucketBuilder(task)
+        self.classes = self._classes(self.periods)
+        self.edge_sets = self._edge_sets(self.periods)
+        self.incompatible_bins = len(self.edge_sets) > 1
+        self.bins = next((item for period in self.periods for item in period.bins), {})
+
+        self.summarizer = PeriodSummarizer(task, self.classes, self.edge_sets[0] if self.edge_sets else None, detail)
         self.splits = SplitFinder(self.summarizer)
-        self.series = SeriesAnalyzer(self.summarizer)
         self.rules = DriftRules()
 
     def run(self) -> DriftAnalysisResult:
         config = self.config
         comparison_mode = self.windows.comparison
+        now = datetime.now(timezone.utc)
 
-        bucket, buckets = self._build_buckets()
-        buckets = self.builder.apply_budget(buckets, config.record_budget)
-        analyzed = [record for item in buckets for record in item.records]
-        current = [record for record in analyzed if record.window == DriftWindowMode.CURRENT]
-        reference = [record for record in analyzed if record.window == DriftWindowMode.REFERENCE]
-        summaries = [self.summarizer.bucket(item) for item in buckets]
+        summaries = [self.summarizer.period(item, now) for item in self.periods]
+        consecutive = self._consecutive(self.periods)
 
-        trend: dict[str, dict[str, Any]] = {}
-        outliers: list[dict[str, Any]] = []
-        series_ran = len(buckets) >= config.min_buckets_trend
-        if series_ran:
-            trend = self.series.trends(summaries)
-            outliers = self.series.outliers(summaries)
-
-        min_side = self.splits.min_side_records
         change_point = None
-        secondary: list[dict[str, Any]] = []
         comparison = None
         if comparison_mode:
-            if current and reference:
-                comparison = self.splits.compare(reference, current, self.windows.start_date)
+            if self.current and self.reference and not self.incompatible_bins:
+                comparison = self.splits.compare(self.reference, self.current, self.windows.start_date)
             insufficient_data = comparison is None or not comparison["sides_sufficient"]
-            insufficient_buckets = False
+            insufficient_periods = False
             split = comparison
         else:
-            insufficient_buckets = len(buckets) < config.min_buckets_changepoint
-            if not insufficient_buckets:
-                change_point, secondary = self._change_points(buckets, outliers)
-                insufficient_buckets = change_point is None
-            insufficient_data = len(current) < min_side or (
+            insufficient_periods = len(self.current) < config.min_periods_changepoint
+            if not insufficient_periods and not self.incompatible_bins:
+                change_point = self.splits.primary(self.current)
+                insufficient_periods = change_point is None
+            total_predictions = sum(item.prediction_count for item in self.current)
+            insufficient_data = total_predictions < self.splits.min_side_records or (
                 change_point is not None and not change_point["sides_sufficient"]
             )
             split = change_point
 
-        hard_breaks = self._hard_breaks(self.records)
-        if split is not None:
-            hard_breaks.extend(self._elapsed_break(split))
+        hard_breaks = self._hard_breaks(self.periods)
+        flags = self.rules.flags(
+            split, hard_breaks, insufficient_data, insufficient_periods, self.incompatible_bins
+        )
 
-        flags = self.rules.flags(split, trend, outliers, hard_breaks, insufficient_data, insufficient_buckets)
-
-        box_count = sum(record.box_count for record in self.records) if self.summarizer.detection else None
-        quality = self.extractor.quality.model_dump()
-        quality.update({
-            "record_count": len(self.records),
-            "box_count": box_count,
-            "analyzed_record_count": len(analyzed),
-            "sampling_ratio": len(analyzed) / len(self.records) if self.records else 1.0,
-            "merged_buckets": self.builder.merged_start_dates
-        })
+        everything = sum_periods(self.periods) if self.periods else None
         reference_range = self.windows.reference
 
         result = {
             "model_name": self.model_name,
             "model_version": self.model_version,
             "task": self.task,
-            "mode": DriftMode.COMPARISON if comparison_mode else DriftMode.RANGE,
+            "mode": self.mode,
+            "analysis_mode": DriftMode.COMPARISON if comparison_mode else DriftMode.RANGE,
             "filters": self.filters,
+            "sites_seen": {
+                "gbms": everything.gbms if everything else [],
+                "processes": everything.processes if everything else [],
+                "modes": everything.modes if everything else [],
+                "equipment_ids": [self.filters.equipment_id] if self.filters.equipment_id
+                else (everything.equipment_ids if everything else [])
+            },
+            "granularity": self.granularity,
+            "detail": self.detail,
             "range": self.windows.current.model_dump(),
             "reference_range": reference_range.model_dump() if reference_range else None,
-            "bucket": bucket,
-            "detail": self.detail,
             "status": {
-                "analysis_possible": (change_point is not None) or (comparison is not None),
-                "change_point_ran": change_point is not None,
+                "analysis_possible": (change_point is not None and change_point["sides_sufficient"])
+                or (comparison is not None and comparison["sides_sufficient"]),
+                "split_ran": change_point is not None,
                 "comparison_ran": comparison is not None,
-                "trend_ran": series_ran,
-                "outlier_ran": series_ran,
-                "bucket_count": len(buckets)
+                "period_count": len(self.current),
+                "reference_period_count": len(self.reference)
             },
-            "data_quality": quality,
-            "classes": self.summarizer.classes,
-            "buckets": summaries if self.detail == DriftDetail.FULL
-            else [self.summarizer.compact(item) for item in summaries],
+            "data_quality": {
+                "document_count": everything.document_count if everything else 0,
+                "product_count": len(everything.product_ids) if everything else 0,
+                "inspection_count": everything.inspection_count if everything else 0,
+                "prediction_count": everything.prediction_count if everything else 0,
+                "box_count": everything.box_count if everything and self.summarizer.detection else None,
+                "missing_confidence_count": everything.missing_confidence_count if everything else 0,
+                "parse_error_count": everything.parse_error_count if everything else 0,
+                "partial_periods": [item.start_date for item in summaries if item.partial],
+                "periods_missing_equipment": self.missing_equipment,
+                "incompatible_bins": self.incompatible_bins
+            },
+            "classes": self.classes,
+            "bins": {
+                "confidence_edges": self.bins.get("confidenceEdges") or [],
+                "near_threshold_margin": self.bins.get("nearThresholdMargin"),
+                "boxes_per_image_max": self.bins.get("boxesPerImageMax")
+            },
+            "periods": summaries,
+            "consecutive": consecutive,
             "change_point": change_point,
-            "secondary_change_points": secondary,
             "comparison": comparison,
-            "max_pairwise": self._max_pairwise(buckets),
-            "outlier_buckets": outliers,
-            "trend": trend,
             "hard_breaks": hard_breaks,
             "flags": flags,
             "pre_verdict": self.rules.pre_verdict(flags),
@@ -136,114 +141,85 @@ class DriftAnalyzer:
 
         return DriftAnalysisResult.model_validate(self._round(result, config.decimals))
 
-    def _change_points(
-            self,
-            buckets: Sequence[Bucket],
-            outliers: Sequence[dict[str, Any]]
-    ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
-        flagged = {item["bucket_index"] for item in outliers}
-        excluded = {index for index in flagged if index - 1 not in flagged and index + 1 not in flagged}
-        kept = [index for index in range(len(buckets)) if index not in excluded]
-        searched = [buckets[index] for index in kept]
-        counts = [self.summarizer.side_counts(item.records) for item in searched]
+    @staticmethod
+    def _classes(periods: Sequence[PeriodCounts]) -> list[str]:
+        classes: list[str] = []
+        for period in periods:
+            for name in list(period.classes) + list(period.class_counts) + list(period.per_class):
+                if name not in classes:
+                    classes.append(name)
+        return classes
 
-        primary = self.splits.primary(searched, counts)
-        if primary is None:
-            return None, []
-        secondary = self.splits.secondary(searched, counts, primary)
-        for report in [primary] + secondary:
-            report["bucket_index"] = kept[report["bucket_index"]]
+    @staticmethod
+    def _edge_sets(periods: Sequence[PeriodCounts]) -> list[list[float]]:
+        edge_sets: list[list[float]] = []
+        for period in periods:
+            for item in period.bins:
+                edges = item.get("confidenceEdges")
+                if isinstance(edges, list) and edges and edges not in edge_sets:
+                    edge_sets.append(list(edges))
+        return edge_sets
 
-        return primary, secondary
+    def _consecutive(self, periods: Sequence[PeriodCounts]) -> list[dict[str, Any]]:
+        reports: list[dict[str, Any]] = []
+        for index in range(1, len(periods)):
+            before, after = periods[index - 1], periods[index]
+            same_edges = before.confidence_edges == after.confidence_edges
+            reports.append({
+                "period_index": index,
+                "date": after.start_date,
+                "psi_confidence": self.splits.psi_confidence(before.confidence, after.confidence)
+                if same_edges else None,
+                "psi_class": self.splits.psi_class(before, after),
+                "psi_boxes_per_image": self.splits.psi_boxes_per_image(before, after),
+                "sufficient": self.splits.sides_sufficient(before, after)
+            })
+        return reports
 
-    def _build_buckets(self) -> tuple[str, list[Bucket]]:
-        """Buckets over every record; the bucket size and the merging are decided on the real volumes"""
-        bucket = self.builder.choose(self.records, self.windows.total_days, self.requested_bucket)
-        buckets: list[Bucket] = []
-        if self.windows.comparison:
-            buckets.extend(self.builder.merge_small(self.builder.build(self.reference, bucket, DriftWindowMode.REFERENCE)))
-        buckets.extend(self.builder.merge_small(self.builder.build(self.current, bucket, DriftWindowMode.CURRENT)))
-        return bucket, buckets
+    def _hard_breaks(self, periods: Sequence[PeriodCounts]) -> list[dict[str, Any]]:
+        """Backend, threshold and class list compared between consecutive periods
 
-    def _hard_breaks(self, records: Sequence[Record]) -> list[dict[str, Any]]:
+        Several values inside one period are reported as a break to the list of values, dated at that period.
+        """
         breaks: list[dict[str, Any]] = []
-        last: dict[str, Any] = {}
+        last: dict[tuple[str, str | None], Any] = {}
 
-        for record in records:
-            observed: list[dict[str, Any]] = [
-                {"kind": HardBreakKind.IMAGE_SPEC, "class_name": None, "value": record.image_spec},
-                {"kind": HardBreakKind.BACKEND, "class_name": None, "value": record.backend},
-                {"kind": HardBreakKind.CLASSES, "class_name": None,
-                 "value": list(record.classes) if record.classes else None}
+        for period in periods:
+            observed: list[tuple[HardBreakKind, str | None, Any]] = [
+                (HardBreakKind.BACKEND, None, self._single_or_list(period.backends)),
+                (HardBreakKind.CLASSES, None, list(period.classes) or None)
             ]
             if self.summarizer.detection:
-                thresholds: dict[str, float] = {}
-                for box in record.boxes:
-                    if box.threshold is not None and box.prediction not in thresholds:
-                        thresholds[box.prediction] = box.threshold
                 observed.extend(
-                    {"kind": HardBreakKind.THRESHOLD, "class_name": name, "value": value}
-                    for name, value in thresholds.items()
+                    (HardBreakKind.THRESHOLD, name, self._single_or_list(counts.thresholds))
+                    for name, counts in period.per_class.items()
                 )
             else:
-                observed.append({"kind": HardBreakKind.THRESHOLD, "class_name": None, "value": record.threshold})
+                observed.append((HardBreakKind.THRESHOLD, None, self._single_or_list(period.thresholds)))
 
-            for item in observed:
-                value = item["value"]
+            for kind, class_name, value in observed:
                 if value is None:
                     continue
-                key = f"{item['kind']}:{item['class_name']}"
-                if key in last and last[key] != value:
+                key = (kind, class_name)
+                previous = last.get(key)
+                if (key in last and previous != value) or (key not in last and isinstance(value, list)
+                                                            and kind != HardBreakKind.CLASSES):
                     breaks.append({
-                        "kind": item["kind"],
-                        "class_name": item["class_name"],
-                        "date": record.created_at,
-                        "inspection_id": record.inspection_id,
-                        "from": last[key],
+                        "kind": kind,
+                        "class_name": class_name,
+                        "date": period.start_date,
+                        "from": previous,
                         "to": value
                     })
                 last[key] = value
 
         return breaks
 
-    def _elapsed_break(self, split: dict[str, Any]) -> list[dict[str, Any]]:
-        before = split["before"].get("median_elapsed_time")
-        after = split["after"].get("median_elapsed_time")
-        if not before or after is None:
-            return []
-
-        ratio = after / before
-        if ratio > self.config.elapsed_ratio_high or ratio < self.config.elapsed_ratio_low:
-            return [{
-                "kind": HardBreakKind.ELAPSED_TIME,
-                "date": split["date"],
-                "inspection_id": None,
-                "from": before,
-                "to": after
-            }]
-        return []
-
-    def _max_pairwise(self, buckets: Sequence[Bucket]) -> dict[str, dict[str, Any]]:
-        if len(buckets) < 2:
-            return {}
-
-        counts = [self.summarizer.side_counts(item.records) for item in buckets]
-        class_keys = sorted({key for item in counts for key in item.class_counts})
-        distributions = {
-            "psi_confidence": [stats.proportions(item.confidence_counts) for item in counts],
-            "psi_class": [stats.proportions([item.class_counts.get(key, 0) for key in class_keys]) for item in counts]
-        }
-
-        best: dict[str, dict[str, Any]] = {}
-        for name, dists in distributions.items():
-            best[name] = {"value": 0.0, "pair": [buckets[0].start_date, buckets[1].start_date]}
-            for i in range(len(buckets)):
-                for j in range(i + 1, len(buckets)):
-                    value = stats.psi(dists[i], dists[j], self.config.eps)
-                    if value > best[name]["value"]:
-                        best[name] = {"value": value, "pair": [buckets[i].start_date, buckets[j].start_date]}
-
-        return best
+    @staticmethod
+    def _single_or_list(values: Sequence[Any]) -> Any:
+        if not values:
+            return None
+        return values[0] if len(values) == 1 else list(values)
 
     @classmethod
     def _round(cls, value: Any, decimals: int) -> Any:
@@ -255,4 +231,6 @@ class DriftAnalyzer:
             return {key: cls._round(item, decimals) for key, item in value.items()}
         if isinstance(value, (list, tuple)):
             return [cls._round(item, decimals) for item in value]
+        if hasattr(value, "model_dump"):
+            return cls._round(value.model_dump(by_alias=False), decimals)
         return value

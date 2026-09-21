@@ -11,10 +11,12 @@ ROOT_DIR = pathlib.Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from tests.drift.synthetic import generate_rows, cls_prediction  # noqa: E402
+from tests.drift.synthetic import generate_documents, aggregate  # noqa: E402
 
-# Seven days of classification rows with a confidence drop on day four, as the drift pipeline would emit them
-DRIFT_ROWS = generate_rows("cls", 7, 300, lambda rng, day: cls_prediction(rng, 0.93 if day < 4 else 0.84, 0.02))
+# Seven daily statistics documents of a classification model with a confidence drop on day four, and the rows the
+# drift pipeline returns for them (one row per period and entry)
+DRIFT_DOCUMENTS = generate_documents("cls", 7, lambda day: 0.93 if day < 4 else 0.84, n=600, ng_rate=0.02)
+DRIFT_ROWS = aggregate(DRIFT_DOCUMENTS)
 
 
 class AsyncRowCursor:
@@ -315,14 +317,13 @@ def mock_async_mongodb_db(mocker):
             dataset_families_cursor if "datasetFamilyName" in query else dataset_documents_cursor
     )
 
-    inspections = mocker.MagicMock(name="InspectionsCollectionMocker")
-    inspections.count_documents = mocker.AsyncMock(return_value=len(DRIFT_ROWS))
-    inspections.aggregate = mocker.MagicMock(side_effect=lambda pipeline, **kwargs: AsyncRowCursor(DRIFT_ROWS))
+    statistics = mocker.MagicMock(name="InspectionStatisticsCollectionMocker")
+    statistics.aggregate = mocker.MagicMock(side_effect=lambda pipeline, **kwargs: AsyncRowCursor(DRIFT_ROWS))
 
     collections_by_name = {
         DBCollections.DAILY_MODELS: daily_models,
         DBCollections.DATASETS: datasets,
-        DBCollections.INSPECTIONS: inspections
+        DBCollections.INSPECTIONS_STATISTICS: statistics
     }
 
     db.__getitem__.side_effect = lambda name: collections_by_name.get(name, collection_a)

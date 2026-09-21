@@ -1,56 +1,85 @@
 from datetime import timedelta
 
-from mongodb_mcp.drift import DriftQueryBuilder
+from common.constants import Granularity
+from mongodb_mcp.drift import StatisticsQuery
 from tests.drift.synthetic import START
 
 END = START + timedelta(days=7)
-ANY_TASK = {"$in": ["cls", "det"]}
 
 
-class TestDriftQueryBuilder:
-    def test_build_filters(self):
-        builder = DriftQueryBuilder(
-            "MetalCls/1.0", START, END, task="cls", filters={"gbm": "SEV", "equipment_id": "EQ-01", "mode": "production"}
+class TestStatisticsQuery:
+    def test_match_with_every_filter(self):
+        query = StatisticsQuery(
+            "MetalCls", "1.0", START, END, Granularity.DAILY, task="cls", gbm="SEV", process="SMD",
+            mode="production", equipment_id="EQ-01", product_id="PR-01"
         )
-        assert builder.build() == {
-            "isDeleted": False,
-            "metadata.createdAt": {"$gte": START, "$lte": END},
-            "inspectionResult.aiResults": {"$elemMatch": {"aiModel": "MetalCls/1.0", "task": "cls"}},
-            "metadata.gbm": "SEV",
-            "metadata.equipmentId": "EQ-01",
-            "metadata.mode": "production"
+        match = query.build_match()
+        assert match == {
+            "modelName": "MetalCls",
+            "modelVersion": "1.0",
+            "task": "cls",
+            "mode": "production",
+            "gbm": "SEV",
+            "process": "SMD",
+            "granularity": "daily",
+            "startDate": {"$gte": START, "$lt": END},
+            "productId": "PR-01"
         }
 
-    def test_build_without_optional_filters(self):
-        query = DriftQueryBuilder("MetalCls/1.0", START, END, filters={"gbm": None, "mode": None}).build()
-        assert set(query) == {"isDeleted", "metadata.createdAt", "inspectionResult.aiResults"}
-        assert query["inspectionResult.aiResults"] == {"$elemMatch": {"aiModel": "MetalCls/1.0", "task": ANY_TASK}}
+    def test_match_without_optional_filters(self):
+        match = StatisticsQuery("MetalCls", "1.0", START, END, Granularity.HOURLY).build_match()
+        assert match["task"] == {"$in": ["cls", "det"]}
+        assert match["granularity"] == "hourly"
+        assert "mode" not in match and "gbm" not in match and "process" not in match and "productId" not in match
 
-        query = DriftQueryBuilder("MetalCls/1.0", START, END).build()
-        assert set(query) == {"isDeleted", "metadata.createdAt", "inspectionResult.aiResults"}
+    def test_match_follows_the_unique_index_order(self):
+        match = StatisticsQuery(
+            "MetalCls", "1.0", START, END, Granularity.DAILY, task="cls", mode="production", gbm="SEV", process="SMD"
+        ).build_match()
+        assert list(match) == ["modelName", "modelVersion", "task", "mode", "gbm", "process", "granularity", "startDate"]
 
-    def test_both_boundaries_are_inclusive(self):
-        query = DriftQueryBuilder("MetalCls/1.0", START, END).build()
-        assert query["metadata.createdAt"] == {"$gte": START, "$lte": END}
+    def test_end_of_window_is_exclusive(self):
+        match = StatisticsQuery("MetalCls", "1.0", START, END, Granularity.DAILY).build_match()
+        assert match["startDate"] == {"$gte": START, "$lt": END}
+
+    def test_block_is_total_by_default(self):
+        assert StatisticsQuery("MetalCls", "1.0", START, END, Granularity.DAILY).build_block() == "$total"
+
+    def test_block_is_the_equipment_entry(self):
+        block = StatisticsQuery("MetalCls", "1.0", START, END, Granularity.DAILY, equipment_id="EQ-01").build_block()
+        assert block["$arrayElemAt"][1] == 0
+        condition = block["$arrayElemAt"][0]["$filter"]["cond"]
+        assert condition == {"$eq": ["$$item.equipmentId", "EQ-01"]}
+        pipeline = StatisticsQuery("MetalCls", "1.0", START, END, Granularity.DAILY, equipment_id="EQ-01").build_pipeline()
+        assert pipeline[2]["$addFields"]["configBackends"] == ["$block.backend"]
+        assert pipeline[2]["$addFields"]["configThresholds"] == ["$block.threshold"]
 
     def test_pipeline_shape(self):
-        builder = DriftQueryBuilder("MetalCls/1.0", START, END, task="cls")
-        pipeline = builder.build_pipeline()
+        query = StatisticsQuery("MetalCls", "1.0", START, END, Granularity.DAILY, task="cls")
+        pipeline = query.build_pipeline()
         stages = [next(iter(stage)) for stage in pipeline]
+        assert stages == ["$match", "$project", "$addFields", "$unwind", "$group", "$addFields", "$project", "$sort"]
+        assert pipeline[0]["$match"] == query.build_match()
+        assert pipeline[1]["$project"]["block"] == "$total"
+        assert pipeline[3]["$unwind"] == "$entries"
+        assert pipeline[2]["$addFields"]["configBackends"] == "$equipmentBackends"
 
-        assert stages == ["$match", "$sort", "$project", "$unwind", "$match", "$unwind", "$project", "$unset"]
-        assert pipeline[0]["$match"] == builder.build()
-        assert pipeline[1]["$sort"] == {"metadata.createdAt": 1}
-        assert pipeline[3]["$unwind"]["includeArrayIndex"] == "entryIndex"
-        assert pipeline[4]["$match"] == {
-            "inspectionResult.aiResults.aiModel": "MetalCls/1.0", "inspectionResult.aiResults.task": "cls"
-        }
-        final = pipeline[6]["$project"]
-        assert final["prediction"] == "$inspectionResult.aiResults.predictions"
-        assert final["createdAt"] == "$metadata.createdAt"
-        assert "dataSpec" in final and "classes" in final and "backend" in final
-        assert pipeline[7]["$unset"] == ["prediction.feedbacks", "prediction.detections.feedbacks"]
+        group = pipeline[4]["$group"]
+        assert group["_id"] == {"date": "$startDate", "kind": "$entries.kind", "k": "$entries.k"}
+        assert group["predictionCount"] == {"$sum": "$block.predictionCount"}
+        assert group["histograms"] == {"$push": "$entries.v.histogram"}
+        assert group["classCount"] == {"$sum": "$entries.v.classCount"}
+        assert group["documentCount"]["$sum"]["$cond"][1:] == [1, 0]
+        assert group["missingBlockCount"]["$sum"]["$cond"][1:] == [0, 1]
 
-    def test_pipeline_without_task(self):
-        pipeline = DriftQueryBuilder("MetalCls/1.0", START, END).build_pipeline()
-        assert pipeline[4]["$match"] == {"inspectionResult.aiResults.aiModel": "MetalCls/1.0"}
+        assert "histogram" in pipeline[5]["$addFields"] and "boxesPerImageHistogram" in pipeline[5]["$addFields"]
+        assert pipeline[6]["$project"] == {"histograms": 0, "boxesPerImageHistograms": 0}
+        assert pipeline[7]["$sort"] == {"_id.date": 1, "_id.kind": 1, "_id.k": 1}
+
+    def test_entries_cover_total_classes_and_counts(self):
+        pipeline = StatisticsQuery("MetalCls", "1.0", START, END, Granularity.DAILY).build_pipeline()
+        parts = pipeline[2]["$addFields"]["entries"]["$concatArrays"]
+        assert parts[0][0]["kind"] == "total" and parts[0][0]["k"] is None
+        assert parts[1]["$map"]["in"]["kind"] == "class"
+        assert parts[2]["$map"]["in"]["kind"] == "count"
+        assert parts[2]["$map"]["in"]["v"] == {"classCount": "$$item.v"}

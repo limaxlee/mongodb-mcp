@@ -1,451 +1,282 @@
-import json
-import random
-import pytest
-from datetime import timedelta, timezone
+import math
+from datetime import datetime, timedelta, timezone
 
-from common.config import SETTINGS, DataDriftConfig
-from common.constants import DriftWindowMode, DriftFlag, PreVerdict, HardBreakKind
-from mongodb_mcp.drift import DriftAnalyzer, DriftWindow, RecordExtractor
-from mongodb_mcp.schemas import DriftAnalysisResult
-from tests.drift.synthetic import generate_rows, make_row, cls_prediction, det_prediction, START
+from common.config import SETTINGS
+from common.constants import DriftFlag, PreVerdict, DriftWindowMode, HardBreakKind, Granularity, MedianSource
+from mongodb_mcp.schemas import DriftFilters, DriftAnalysisResult
+from mongodb_mcp.drift import DriftWindow, DriftAnalyzer, build_periods
+from tests.drift.synthetic import START, EDGES, generate_documents, aggregate
 
-DAYS = 14
-END = START + timedelta(days=DAYS)
-FILTERS = {"gbm": "SEV", "process": None, "location": None, "equipment_id": None, "mode": "production"}
+CONFIG = SETTINGS.data_drift
 
 
-def extract(rows, task=None, reference_rows=None):
-    extractor = RecordExtractor(task=task)
-    for row in reference_rows or []:
-        extractor.add_record(row, DriftWindowMode.REFERENCE)
-    for row in rows:
-        extractor.add_record(row)
-    extractor.quality.scanned_document_count = len(rows) + len(reference_rows or [])
-    return extractor
+def analyse(
+        task="cls",
+        confidences=(0.93, 0.93, 0.93, 0.93, 0.84, 0.84, 0.84),
+        reference_confidences=None,
+        n=600,
+        granularity="daily",
+        equipment_id=None,
+        detail="full",
+        mode="production",
+        **kwargs
+):
+    hours = {"hourly": 1, "shift": 12, "daily": 24, "weekly": 168}[granularity]
+    documents = generate_documents(task, len(confidences), lambda i: confidences[i], n=n, granularity=granularity, **kwargs)
+    periods = build_periods(aggregate(documents, equipment_id), DriftWindowMode.CURRENT)
+    reference_start = reference_end = None
+    if reference_confidences is not None:
+        reference_start = START - timedelta(hours=hours * len(reference_confidences))
+        reference_documents = generate_documents(
+            task, len(reference_confidences), lambda i: reference_confidences[i], n=n, granularity=granularity,
+            start=reference_start, seed=11, **kwargs
+        )
+        periods = build_periods(aggregate(reference_documents, equipment_id), DriftWindowMode.REFERENCE) + periods
+        reference_end = START
+
+    windows = DriftWindow(START, START + timedelta(hours=hours * len(confidences)), reference_start, reference_end)
+    windows.validate()
+    analyzer = DriftAnalyzer(
+        "MetalCls", "1.0", task, mode, periods, windows,
+        DriftFilters(gbm="SEV", equipment_id=equipment_id), Granularity(granularity), detail
+    )
+    return analyzer.run()
 
 
-def analyze(rows, task=None, days=DAYS, windows=None, **kwargs):
-    extractor = extract(rows, task)
-    windows = windows or DriftWindow(start_date=START, end_date=START + timedelta(days=days))
-    return DriftAnalyzer("Metal", "1.0", extractor.get_task() or task, extractor, windows, FILTERS, **kwargs).run()
-
-
-class TestScenarios:
-    def test_no_drift_is_stable(self):
-        rows = generate_rows("cls", DAYS, 400, lambda rng, day: cls_prediction(rng, 0.93, 0.2), seed=3)
-        result = analyze(rows)
-
-        assert result.pre_verdict == PreVerdict.STABLE
-        assert result.flags == []
-        assert result.change_point is not None and result.change_point.psi_confidence < 0.1
-        assert result.change_point.candidate_count == DAYS - 2 * SETTINGS.data_drift.min_segment_buckets + 1
-        assert result.status.analysis_possible and result.status.trend_ran and result.status.outlier_ran
-        assert result.bucket == "1d" and result.task == "cls" and result.mode == "range"
-        assert result.status.bucket_count == DAYS
-
-    def test_step_change_is_found_on_day_eight(self):
-        rows = generate_rows("cls", DAYS, 400, lambda rng, day: cls_prediction(rng, 0.93 if day < 7 else 0.8, 0.2))
-        result = analyze(rows)
-
-        assert DriftFlag.CONFIDENCE_SHIFT in result.flags
-        assert result.pre_verdict == PreVerdict.DRIFT_LIKELY
-        assert result.change_point.bucket_index == 7
-        assert result.change_point.date == START + timedelta(days=7)
+class TestRangeMode:
+    def test_step_is_found_and_flagged(self):
+        result = analyse()
+        assert isinstance(result, DriftAnalysisResult)
+        assert result.analysis_mode == "range" and result.task == "cls" and result.mode == "production"
+        assert result.granularity == Granularity.DAILY and result.detail == "full"
+        assert result.status.analysis_possible and result.status.split_ran and not result.status.comparison_ran
+        assert result.status.period_count == 7 and result.status.reference_period_count == 0
+        assert result.change_point.period_index == 4 and result.change_point.date == START + timedelta(days=4)
+        assert result.change_point.psi_confidence > CONFIG.psi_significant
         assert result.change_point.sides_sufficient
-        assert result.change_point.before.confidence_quantiles.p50 > result.change_point.after.confidence_quantiles.p50
-        assert result.change_point.psi_confidence >= SETTINGS.data_drift.psi_significant
-
-    def test_gradual_trend_is_flagged(self):
-        rows = generate_rows("cls", DAYS, 400, lambda rng, day: cls_prediction(rng, 0.93 - 0.006 * day, 0.2))
-        result = analyze(rows)
-
-        assert DriftFlag.TREND_MEDIAN_CONFIDENCE in result.flags
-        assert result.trend["median_confidence"].tau < -0.5
-        assert result.trend["median_confidence"].slope_per_bucket < 0
-        assert result.trend["median_confidence"].meaningful
-
-    def test_one_bad_day_is_a_transient(self):
-        rows = generate_rows("cls", DAYS, 300, lambda rng, day: cls_prediction(rng, 0.6 if day == 6 else 0.9, 0.2))
-        result = analyze(rows)
-
-        assert result.flags == [DriftFlag.TRANSIENT_OUTLIER]
-        assert result.pre_verdict == PreVerdict.SUSPICIOUS
-        assert 6 in {item.bucket_index for item in result.outlier_buckets}
-        # The bad bucket is left out of the split search, so no persistent shift is reported
-        assert result.change_point.psi_confidence < 0.1
-        assert result.change_point.bucket_index != 6
-
-    def test_two_bad_days_are_a_shift(self):
-        rows = generate_rows(
-            "cls", DAYS, 300, lambda rng, day: cls_prediction(rng, 0.6 if day in (6, 7) else 0.9, 0.2)
-        )
-        result = analyze(rows)
-        assert DriftFlag.CONFIDENCE_SHIFT in result.flags
-        # Two flagged neighbours are a level change and stay in the search; the split lands on either edge of them
-        assert result.change_point.bucket_index in (6, 8)
-
-    def test_transient_next_to_a_step_does_not_hide_it(self):
-        rows = generate_rows(
-            "cls", DAYS, 300,
-            lambda rng, day: cls_prediction(rng, 0.6 if day == 3 else (0.9 if day < 8 else 0.75), 0.2)
-        )
-        result = analyze(rows)
-        assert DriftFlag.CONFIDENCE_SHIFT in result.flags
-        assert result.change_point.bucket_index == 8
-        assert result.change_point.date == START + timedelta(days=8)
-
-    def test_detection_transient_on_box_count(self):
-        rows = generate_rows(
-            "det", DAYS, 250,
-            lambda rng, day: det_prediction(rng, 0.93, 0.1, no_box_rate=0.3 if day == 6 else 0.02)
-        )
-        result = analyze(rows)
-
-        assert result.flags == [DriftFlag.TRANSIENT_OUTLIER]
-        assert result.pre_verdict == PreVerdict.SUSPICIOUS
-        assert {item.series for item in result.outlier_buckets} <= {"no_box_rate", "mean_boxes_per_image"}
-        assert {item.bucket_index for item in result.outlier_buckets} == {6}
-
-    def test_resolution_change_is_a_hard_break(self):
-        rng = random.Random(3)
-        rows = []
-        for day in range(DAYS):
-            scale = 1 if day < 7 else 2
-            for slot in range(250):
-                prediction = det_prediction(rng, 0.93, 0.1)
-                for detection in prediction["detections"]:
-                    detection["bbox"] = [value * scale for value in detection["bbox"]]
-                rows.append(make_row(len(rows), START + timedelta(days=day, seconds=slot * 345), "det", prediction,
-                                     image=(400 * scale, 400 * scale, 3)))
-        result = analyze(rows)
-
-        assert result.flags == [DriftFlag.HARD_BREAK]
+        assert DriftFlag.CONFIDENCE_SHIFT in result.flags and DriftFlag.THRESHOLD_PRESSURE in result.flags
+        assert DriftFlag.CLASS_SHIFT not in result.flags
         assert result.pre_verdict == PreVerdict.DRIFT_LIKELY
-        assert [item.kind for item in result.hard_breaks] == [HardBreakKind.IMAGE_SPEC]
-        assert result.hard_breaks[0].from_value == [400, 400, 3] and result.hard_breaks[0].to_value == [800, 800, 3]
-        assert result.hard_breaks[0].date == START + timedelta(days=7)
-        assert result.hard_breaks[0].class_name is None
+        assert result.comparison is None and result.reference_range is None
 
-    def test_detection_thresholds_are_tracked_per_class(self):
-        def rows_for(ng_threshold_for_day):
-            rng = random.Random(2)
-            rows = []
-            for day in range(8):
-                for slot in range(200):
-                    prediction = det_prediction(rng, 0.85, 0.3)
-                    for detection in prediction["detections"]:
-                        detection["threshold"] = ng_threshold_for_day(day) if detection["prediction"] == "NG" else 0.5
-                    rows.append(make_row(len(rows), START + timedelta(days=day, seconds=slot * 432), "det", prediction))
-            return rows
+    def test_series_and_consecutive_divergence(self):
+        result = analyse()
+        assert len(result.periods) == 7 and all(item.window == "current" for item in result.periods)
+        assert [item.start_date for item in result.periods] == [START + timedelta(days=i) for i in range(7)]
+        assert all(item.median_source == MedianSource.EXACT for item in result.periods)
+        assert result.periods[0].mean_confidence > result.periods[-1].mean_confidence + 0.05
 
-        stable = analyze(rows_for(lambda day: 0.8), days=8)
-        assert stable.hard_breaks == [] and DriftFlag.HARD_BREAK not in stable.flags
+        assert [item.period_index for item in result.consecutive] == list(range(1, 7))
+        spike = max(result.consecutive, key=lambda item: item.psi_confidence)
+        assert spike.date == START + timedelta(days=4) and spike.psi_confidence > CONFIG.psi_significant
+        assert all(item.psi_confidence < CONFIG.psi_moderate for item in result.consecutive if item is not spike)
+        assert all(item.sufficient for item in result.consecutive)
 
-        changed = analyze(rows_for(lambda day: 0.8 if day < 5 else 0.6), days=8)
-        assert len(changed.hard_breaks) == 1
-        item = changed.hard_breaks[0]
-        assert item.kind == HardBreakKind.THRESHOLD and item.class_name == "NG"
-        assert item.from_value == 0.8 and item.to_value == 0.6
-        # The break is dated at the first record of day 5 that carries an NG box
-        assert START + timedelta(days=5) <= item.date < START + timedelta(days=6)
+    def test_quiet_series_is_stable(self):
+        result = analyse(confidences=(0.93,) * 6)
+        assert result.flags == [] and result.pre_verdict == PreVerdict.STABLE
+        assert result.change_point is not None and result.change_point.psi_confidence < CONFIG.psi_moderate
 
-    def test_classification_threshold_change_is_a_hard_break(self):
-        rows = generate_rows(
-            "cls", DAYS, 300, lambda rng, day: cls_prediction(rng, 0.93, 0.2, threshold=0.8 if day < 5 else 0.7)
-        )
-        result = analyze(rows)
-        assert [item.kind for item in result.hard_breaks] == [HardBreakKind.THRESHOLD]
-        assert result.hard_breaks[0].from_value == 0.8 and result.hard_breaks[0].to_value == 0.7
-        assert result.hard_breaks[0].inspection_id == rows[5 * 300]["_id"]
+    def test_identity_and_sites(self):
+        result = analyse()
+        assert result.model_name == "MetalCls" and result.model_version == "1.0"
+        assert result.filters.gbm == "SEV" and result.filters.equipment_id is None
+        assert result.sites_seen.gbms == ["SEV"] and result.sites_seen.processes == ["SMD"]
+        assert result.sites_seen.modes == ["production"] and result.sites_seen.equipment_ids == ["EQ-01"]
+        assert result.classes == ["Good", "NG"]
+        assert result.bins.confidence_edges == EDGES and result.bins.near_threshold_margin == 0.05
+        assert result.range.days == 7.0
+        assert result.config["psi_significant"] == CONFIG.psi_significant
 
-    def test_backend_and_class_list_changes(self):
-        rows = generate_rows("cls", DAYS, 300, lambda rng, day: cls_prediction(rng, 0.93, 0.2))
-        for row in rows[8 * 300:]:
-            row["backend"] = "onnx"
-            row["classes"] = ["Good", "NG", "Scratch"]
-        result = analyze(rows)
+    def test_data_quality(self):
+        result = analyse(products=3)
+        quality = result.data_quality
+        assert quality.document_count == 21 and quality.product_count == 21
+        assert quality.prediction_count == 7 * 600 and quality.box_count is None
+        assert quality.missing_confidence_count == 0 and quality.parse_error_count == 0
+        assert quality.partial_periods == [] and quality.periods_missing_equipment == []
+        assert not quality.incompatible_bins
+        assert all(item.median_source == MedianSource.HISTOGRAM for item in result.periods)
+        assert all(item.document_count == 3 and item.product_count == 3 for item in result.periods)
 
-        assert {item.kind for item in result.hard_breaks} == {HardBreakKind.BACKEND, HardBreakKind.CLASSES}
-        assert result.classes == ["Good", "NG", "Scratch"]
-        assert result.pre_verdict == PreVerdict.DRIFT_LIKELY
+    def test_partial_period_is_reported(self):
+        now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+        documents = generate_documents("cls", 3, lambda i: 0.9, n=600, granularity="hourly", start=now - timedelta(hours=2))
+        periods = build_periods(aggregate(documents), DriftWindowMode.CURRENT)
+        windows = DriftWindow(now - timedelta(hours=2), now + timedelta(hours=1))
+        result = DriftAnalyzer("MetalCls", "1.0", "cls", None, periods, windows, DriftFilters(), Granularity.HOURLY).run()
+        assert result.data_quality.partial_periods == [now]
+        assert result.periods[-1].partial and not result.periods[0].partial
 
-    def test_list_confidence_in_detections(self):
-        rows = generate_rows("det", DAYS, 250, lambda rng, day: det_prediction(rng, 0.9, 0.1, list_confidence=True))
-        result = analyze(rows)
+    def test_compact_detail(self):
+        result = analyse(detail="compact")
+        assert result.detail == "compact"
+        assert all(item.confidence_histogram is None and item.per_class == {} for item in result.periods)
+        assert result.change_point.before.confidence_histogram is not None
+        assert DriftFlag.CONFIDENCE_SHIFT in result.flags
 
-        assert result.data_quality.missing_confidence_count == 0
-        assert result.buckets[3].median_confidence == pytest.approx(0.9, abs=0.02)
+    def test_too_few_periods(self):
+        result = analyse(confidences=(0.93, 0.93, 0.84))
+        assert result.change_point is None and not result.status.analysis_possible
+        assert DriftFlag.INSUFFICIENT_PERIODS in result.flags
+        assert result.pre_verdict == PreVerdict.UNDETERMINED
+        assert len(result.consecutive) == 2
 
-    def test_model_repeated_in_document(self):
-        rows = generate_rows("cls", DAYS, 300, lambda rng, day: cls_prediction(rng, 0.93, 0.2))
-        rows += [
-            dict(row, entryIndex=1, prediction=cls_prediction(random.Random(index), 0.93, 0.2))
-            for index, row in enumerate(rows)
-        ]
-        result = analyze(rows)
-
-        assert result.data_quality.record_count == 2 * DAYS * 300
-        assert result.data_quality.matched_document_count == DAYS * 300
-        assert result.data_quality.matched_entry_count == 2 * DAYS * 300
-
-
-class TestInsufficiency:
     def test_too_little_data(self):
-        rows = generate_rows("cls", 2, 30, lambda rng, day: cls_prediction(rng, 0.93, 0.2))
-        result = analyze(rows, days=2)
-
-        assert result.pre_verdict == PreVerdict.UNDETERMINED
-        assert DriftFlag.INSUFFICIENT_DATA in result.flags and DriftFlag.INSUFFICIENT_BUCKETS in result.flags
-        assert result.status.analysis_possible is False
-        assert result.change_point is None
-
-    def test_no_side_can_be_sufficient(self):
-        rows = generate_rows("cls", 4, 220, lambda rng, day: cls_prediction(rng, 0.93 if day < 3 else 0.6, 0.2))
-        result = analyze(rows, days=4)
-
-        assert result.flags == [DriftFlag.INSUFFICIENT_DATA]
-        assert result.pre_verdict == PreVerdict.UNDETERMINED
+        result = analyse(n=40)
+        assert DriftFlag.INSUFFICIENT_DATA in result.flags
         assert result.change_point is not None and not result.change_point.sides_sufficient
-        assert result.change_point.psi_confidence > 1.0
-
-    def test_three_buckets_cannot_be_split(self):
-        rows = generate_rows("cls", 3, 300, lambda rng, day: cls_prediction(rng, 0.93, 0.2))
-        result = analyze(rows, days=3)
-
-        assert result.flags == [DriftFlag.INSUFFICIENT_BUCKETS]
+        assert DriftFlag.CONFIDENCE_SHIFT not in result.flags
         assert result.pre_verdict == PreVerdict.UNDETERMINED
-        assert result.status.analysis_possible is False and result.status.bucket_count == 3
 
-    def test_detection_needs_boxes_on_each_side(self):
-        rows = generate_rows(
-            "det", 8, 150, lambda rng, day: det_prediction(rng, 0.85, 0.3, boxes_mean=0.3, no_box_rate=0.6)
+    def test_class_shift(self):
+        result = analyse(
+            confidences=(0.93,) * 6, stats_kwargs_for_period=lambda i: {"ng_rate": 0.02 if i < 3 else 0.3}
         )
-        result = analyze(rows, days=8)
-        assert DriftFlag.INSUFFICIENT_DATA in result.flags
-        assert result.data_quality.record_count == 1200 and result.data_quality.box_count < 600
-
-    def test_no_records_at_all(self):
-        result = analyze([], task="det")
-        assert result.pre_verdict == PreVerdict.UNDETERMINED
-        assert result.status.bucket_count == 0
-        assert result.data_quality.record_count == 0 and result.data_quality.box_count == 0
-        assert result.buckets == [] and result.trend == {} and result.max_pairwise == {}
+        assert DriftFlag.CLASS_SHIFT in result.flags and result.change_point.period_index == 3
+        assert result.change_point.max_class_proportion_change > 0.2
+        assert DriftFlag.CONFIDENCE_SHIFT not in result.flags
 
 
-class TestModesAndOutput:
-    def test_comparison_mode(self):
-        reference_rows = generate_rows(
-            "cls", 7, 400, lambda rng, day: cls_prediction(rng, 0.93, 0.2), start=START - timedelta(days=7),
-            first_index=100_000
-        )
-        current_rows = generate_rows("cls", 7, 400, lambda rng, day: cls_prediction(rng, 0.84, 0.2))
-        extractor = extract(current_rows, reference_rows=reference_rows)
-        windows = DriftWindow(
-            start_date=START, end_date=START + timedelta(days=7),
-            reference_start_date=START - timedelta(days=7), reference_end_date=START
-        )
-        result = DriftAnalyzer("Metal", "1.0", "cls", extractor, windows, FILTERS).run()
-
-        assert result.mode == "comparison"
-        assert result.change_point is None and result.comparison is not None
-        assert result.status.comparison_ran and result.status.change_point_ran is False
-        assert result.comparison.date == START and result.comparison.bucket_index is None
+class TestComparisonMode:
+    def test_reference_versus_current(self):
+        result = analyse(confidences=(0.84, 0.84, 0.84), reference_confidences=(0.93, 0.93, 0.93))
+        assert result.analysis_mode == "comparison" and result.status.comparison_ran and not result.status.split_ran
+        assert result.status.period_count == 3 and result.status.reference_period_count == 3
+        assert result.reference_range.days == 3.0
+        assert [item.window for item in result.periods] == ["reference"] * 3 + ["current"] * 3
+        assert result.comparison.period_index is None and result.comparison.date == START
         assert result.comparison.candidate_count == 1
-        assert result.comparison.before_count == len(reference_rows)
-        assert result.comparison.after_count == len(current_rows)
-        assert DriftFlag.CONFIDENCE_SHIFT in result.flags
-        assert [bucket.window for bucket in result.buckets] == [DriftWindowMode.REFERENCE] * 7 + [DriftWindowMode.CURRENT] * 7
-        assert result.reference_range.days == 7.0 and result.reference_range.end_date == START
-        assert result.data_quality.record_count == len(reference_rows) + len(current_rows)
-        assert result.data_quality.scanned_document_count == len(reference_rows) + len(current_rows)
+        assert result.comparison.before.period_count == 3 and result.comparison.after.period_count == 3
+        assert result.comparison.psi_confidence > CONFIG.psi_significant
+        assert DriftFlag.CONFIDENCE_SHIFT in result.flags and result.change_point is None
+        assert result.pre_verdict == PreVerdict.DRIFT_LIKELY
 
-    def test_comparison_with_a_small_reference_is_undetermined(self):
-        reference_rows = generate_rows(
-            "cls", 2, 100, lambda rng, day: cls_prediction(rng, 0.93, 0.2), start=START - timedelta(days=2),
-            first_index=100_000
-        )
-        current_rows = generate_rows("cls", 5, 300, lambda rng, day: cls_prediction(rng, 0.7, 0.5))
-        extractor = extract(current_rows, reference_rows=reference_rows)
-        windows = DriftWindow(
-            start_date=START, end_date=START + timedelta(days=5),
-            reference_start_date=START - timedelta(days=2), reference_end_date=START
-        )
-        result = DriftAnalyzer("Metal", "1.0", "cls", extractor, windows, FILTERS).run()
+    def test_consecutive_crosses_the_boundary(self):
+        result = analyse(confidences=(0.84, 0.84), reference_confidences=(0.93, 0.93))
+        boundary = next(item for item in result.consecutive if item.date == START)
+        assert boundary.period_index == 2 and boundary.psi_confidence > CONFIG.psi_significant
 
-        assert DriftFlag.INSUFFICIENT_DATA in result.flags
+    def test_same_distribution_is_stable(self):
+        result = analyse(confidences=(0.93, 0.93, 0.93), reference_confidences=(0.93, 0.93, 0.93))
+        assert result.flags == [] and result.pre_verdict == PreVerdict.STABLE
+
+    def test_missing_side_is_insufficient(self):
+        documents = generate_documents("cls", 3, lambda i: 0.9, n=600)
+        periods = build_periods(aggregate(documents), DriftWindowMode.CURRENT)
+        windows = DriftWindow(START, START + timedelta(days=3), START - timedelta(days=3), START)
+        result = DriftAnalyzer("MetalCls", "1.0", "cls", None, periods, windows, DriftFilters(), Granularity.DAILY).run()
+        assert result.comparison is None and DriftFlag.INSUFFICIENT_DATA in result.flags
         assert result.pre_verdict == PreVerdict.UNDETERMINED
-        assert result.comparison is not None and not result.comparison.sides_sufficient
-
-    def test_explicit_bucket(self):
-        rows = generate_rows("cls", DAYS, 400, lambda rng, day: cls_prediction(rng, 0.93, 0.2))
-        result = analyze(rows, bucket="1w")
-        assert result.bucket == "1w" and result.status.bucket_count == 3
-
-    def test_compact_detail_drops_histograms(self):
-        rows = generate_rows("det", DAYS, 250, lambda rng, day: det_prediction(rng, 0.93, 0.1))
-        full = analyze(rows, detail="full")
-        compact = analyze(rows, detail="compact")
-
-        assert full.detail == "full" and compact.detail == "compact"
-        assert full.buckets[0].confidence_histogram is not None and full.buckets[0].box is not None
-        assert compact.buckets[0].confidence_histogram is None and compact.buckets[0].box is None
-        assert compact.buckets[0].median_confidence == full.buckets[0].median_confidence
-        assert compact.buckets[0].mean_boxes_per_image == full.buckets[0].mean_boxes_per_image
-        assert compact.flags == full.flags and compact.change_point == full.change_point
-        assert len(compact.model_dump_json()) < len(full.model_dump_json())
-
-    def test_result_is_json_serialisable(self):
-        rows = generate_rows("det", DAYS, 250, lambda rng, day: det_prediction(rng, 0.93, 0.1))
-        result = analyze(rows)
-        payload = json.loads(result.model_dump_json(by_alias=True))
-
-        assert payload["modelName"] == "Metal" and payload["modelVersion"] == "1.0"
-        assert payload["filters"] == FILTERS
-        assert payload["range"] == {"startDate": "2026-09-01T00:00:00Z", "endDate": "2026-09-15T00:00:00Z", "days": 14.0}
-        assert payload["referenceRange"] is None
-        assert payload["buckets"][0]["startDate"] == "2026-09-01T00:00:00Z"
-        assert set(payload["status"]) == {
-            "analysisPossible", "changePointRan", "comparisonRan", "trendRan", "outlierRan", "bucketCount"
-        }
-        assert "psiConfidence" in payload["changePoint"] and "ksNormalizedArea" in payload["changePoint"]
-        assert set(payload["maxPairwise"]) == {"psi_confidence", "psi_class"}
-        assert payload["config"]["confidence_bin_edges"] == [round(index / 10, 1) for index in range(11)]
-        assert DriftAnalysisResult.model_validate(payload) == result
-
-    def test_values_are_rounded(self):
-        rows = generate_rows("cls", DAYS, 300, lambda rng, day: cls_prediction(rng, 0.93, 0.2))
-        result = analyze(rows)
-        decimals = SETTINGS.data_drift.decimals
-        assert result.buckets[0].mean_confidence == round(result.buckets[0].mean_confidence, decimals)
-        assert result.change_point.psi_confidence == round(result.change_point.psi_confidence, decimals)
-
-    def test_full_detection_result_stays_small(self):
-        rows = generate_rows("det", DAYS, 250, lambda rng, day: det_prediction(rng, 0.93, 0.1))
-        payload = analyze(rows).model_dump_json(by_alias=True)
-        assert len(payload) < 40 * 1024
-
-    def test_config_is_echoed(self):
-        rows = generate_rows("cls", 4, 300, lambda rng, day: cls_prediction(rng, 0.93, 0.2))
-        result = analyze(rows, days=4)
-        assert set(result.config) == set(DataDriftConfig.model_fields)
-        assert DataDriftConfig.model_validate(result.config) == SETTINGS.data_drift
-
-    def test_max_pairwise_names_the_buckets(self):
-        rows = generate_rows("cls", DAYS, 400, lambda rng, day: cls_prediction(rng, 0.93 if day < 7 else 0.8, 0.2))
-        result = analyze(rows)
-        pairwise = result.max_pairwise["psi_confidence"]
-        assert pairwise.value >= result.change_point.psi_confidence
-        assert pairwise.pair[0] < START + timedelta(days=7) <= pairwise.pair[1]
-
-    def test_elapsed_time_break(self):
-        rows = generate_rows("cls", DAYS, 300, lambda rng, day: cls_prediction(rng, 0.93 if day < 7 else 0.8, 0.2))
-        for row in rows[7 * 300:]:
-            row["prediction"]["elapsedTime"] = 0.02
-        result = analyze(rows)
-
-        elapsed = [item for item in result.hard_breaks if item.kind == HardBreakKind.ELAPSED_TIME]
-        assert len(elapsed) == 1
-        assert elapsed[0].from_value == 0.008 and elapsed[0].to_value == 0.02 and elapsed[0].inspection_id is None
-        assert DriftFlag.HARD_BREAK not in result.flags
 
 
-class TestWindows:
-    def test_validation(self):
-        with pytest.raises(ValueError, match="before end date"):
-            DriftWindow(start_date=END, end_date=START).validate()
-        with pytest.raises(ValueError, match="max time window is 30"):
-            DriftWindow(start_date=START, end_date=START + timedelta(days=31)).validate()
-        with pytest.raises(ValueError, match="given together"):
-            DriftWindow(start_date=START, end_date=END, reference_start_date=START - timedelta(days=7)).validate()
-        with pytest.raises(ValueError, match="before reference end date"):
-            DriftWindow(start_date=START, end_date=END, reference_start_date=START, reference_end_date=START).validate()
-        with pytest.raises(ValueError, match="end before current window"):
-            DriftWindow(start_date=START, end_date=END, reference_start_date=START - timedelta(days=1),
-                        reference_end_date=START + timedelta(days=1)).validate()
-        with pytest.raises(ValueError, match="max time window is 30"):
-            DriftWindow(start_date=START, end_date=END, reference_start_date=START - timedelta(days=20),
-                        reference_end_date=START).validate()
-
-    def test_ranges(self):
-        windows = DriftWindow(start_date=START, end_date=END, reference_start_date=START - timedelta(days=14),
-                               reference_end_date=START)
-        assert windows.comparison and windows.total_days == 28.0
-        assert windows.current.start_date == START and windows.current.days == 14.0
-        assert windows.reference.end_date == START and windows.reference.days == 14.0
-
-        windows = DriftWindow(start_date=START, end_date=END)
-        assert not windows.comparison and windows.reference is None and windows.total_days == 14.0
-
-    def test_naive_dates_are_treated_as_utc(self):
-        windows = DriftWindow(start_date=START.replace(tzinfo=None), end_date=END.replace(tzinfo=None))
-        assert windows.start_date == START and windows.start_date.tzinfo == timezone.utc
-        assert windows.end_date == END
-
-
-class TestRecordBudget:
-    @staticmethod
-    def with_budget(monkeypatch, budget: int):
-        monkeypatch.setattr(SETTINGS, "data_drift", SETTINGS.data_drift.model_copy(update={"record_budget": budget}))
-
-    def test_default_budget_is_not_reached(self):
-        rows = generate_rows("cls", DAYS, 400, lambda rng, day: cls_prediction(rng, 0.93, 0.2), seed=3)
-        result = analyze(rows)
-
-        assert result.config["record_budget"] == SETTINGS.data_drift.record_budget
-        assert result.data_quality.analyzed_record_count == result.data_quality.record_count == len(rows)
-        assert result.data_quality.sampling_ratio == 1.0
-
-    def test_budget_thins_buckets_and_keeps_the_verdict(self, monkeypatch):
-        self.with_budget(monkeypatch, 3000)
-        rows = generate_rows("cls", DAYS, 400, lambda rng, day: cls_prediction(rng, 0.93 if day < 7 else 0.8, 0.2))
-        result = analyze(rows)
-
-        assert result.config["record_budget"] == 3000
-        assert result.data_quality.record_count == len(rows)
-        assert result.data_quality.analyzed_record_count <= 3000
-        assert result.data_quality.analyzed_record_count == sum(item.record_count for item in result.buckets)
-        assert 0 < result.data_quality.sampling_ratio < 1
-        assert all(item.record_count == 3000 // DAYS for item in result.buckets)
-        assert result.change_point.before_count + result.change_point.after_count == result.data_quality.analyzed_record_count
-        assert DriftFlag.CONFIDENCE_SHIFT in result.flags
-        assert result.change_point.bucket_index == 7 and result.pre_verdict == PreVerdict.DRIFT_LIKELY
-
-    def test_zero_budget_disables_it(self, monkeypatch):
-        self.with_budget(monkeypatch, 0)
-        rows = generate_rows("cls", DAYS, 400, lambda rng, day: cls_prediction(rng, 0.93, 0.2), seed=3)
-        result = analyze(rows)
-
-        assert result.config["record_budget"] == 0
-        assert result.data_quality.analyzed_record_count == len(rows)
-        assert result.data_quality.sampling_ratio == 1.0
-
-    def test_budget_applies_over_both_windows(self, monkeypatch):
-        self.with_budget(monkeypatch, 2800)
-        reference = generate_rows("cls", 7, 400, lambda rng, day: cls_prediction(rng, 0.93, 0.2), seed=1)
-        current = generate_rows(
-            "cls", 7, 400, lambda rng, day: cls_prediction(rng, 0.8, 0.2),
-            start=START + timedelta(days=7), seed=2, first_index=len(reference)
+class TestDetection:
+    def test_detection_series_and_box_shift(self):
+        result = analyse(
+            task="det", confidences=(0.9,) * 6, n=400,
+            stats_kwargs_for_period=lambda i: {"boxes_mean": 1.0 if i < 3 else 3.0}
         )
-        extractor = extract(current, reference_rows=reference)
-        windows = DriftWindow(START + timedelta(days=7), START + timedelta(days=14), START, START + timedelta(days=7))
-        result = DriftAnalyzer("Metal", "1.0", "cls", extractor, windows, FILTERS).run()
+        assert result.task == "det"
+        assert result.data_quality.box_count > 0
+        assert all(item.box_count > 0 and item.mean_boxes_per_image is not None for item in result.periods)
+        assert result.periods[0].boxes_per_image_histogram is not None
+        assert result.periods[0].thresholds_by_class == {"Good": [0.8], "NG": [0.8]}
+        assert all(item.psi_boxes_per_image is not None for item in result.consecutive)
+        assert result.change_point.period_index == 3
+        assert DriftFlag.BOX_COUNT_SHIFT in result.flags and result.pre_verdict == PreVerdict.DRIFT_LIKELY
 
-        assert result.data_quality.record_count == 5600
-        assert result.data_quality.analyzed_record_count == 2800
-        assert result.comparison.before_count == result.comparison.after_count == 1400
+    def test_detection_confidence_shift(self):
+        result = analyse(task="det", confidences=(0.93, 0.93, 0.93, 0.80, 0.80, 0.80), n=400)
         assert DriftFlag.CONFIDENCE_SHIFT in result.flags
+        assert result.change_point.psi_confidence_by_class["Good"] > CONFIG.psi_significant
 
-    def test_hard_breaks_are_scanned_on_every_record(self, monkeypatch):
-        # A budget of 2000 leaves every daily bucket with its minimum of 200 out of 400 records, so thinning keeps
-        # the even offsets within a bucket. A camera change on an odd offset is dropped from the statistics but must
-        # still be found by the hard break scan
-        self.with_budget(monkeypatch, 2000)
-        rows = generate_rows("cls", DAYS, 400, lambda rng, day: cls_prediction(rng, 0.93, 0.2), seed=3)
-        index = 7 * 400 + 101
-        rows[index] = make_row(index, rows[index]["createdAt"], "cls", rows[index]["prediction"], image=(800, 600, 3))
-        result = analyze(rows)
 
-        assert all(item.record_count == SETTINGS.data_drift.min_bucket_records_cls for item in result.buckets)
-        breaks = [item for item in result.hard_breaks if item.kind == HardBreakKind.IMAGE_SPEC]
-        assert [item.inspection_id for item in breaks] == [rows[index]["_id"], rows[index + 1]["_id"]]
-        assert [(item.from_value, item.to_value) for item in breaks] == [([400, 400, 3], [800, 600, 3]), ([800, 600, 3], [400, 400, 3])]
+class TestHardBreaks:
+    def test_backend_and_threshold_break(self):
+        result = analyse(
+            confidences=(0.93,) * 6,
+            stats_kwargs_for_period=lambda i: {"backend": "ts" if i < 2 else "trt", "threshold": 0.8 if i < 4 else 0.9}
+        )
+        kinds = [(item.kind, item.date, item.from_value, item.to_value) for item in result.hard_breaks]
+        assert (HardBreakKind.BACKEND, START + timedelta(days=2), "ts", "trt") in kinds
+        assert (HardBreakKind.THRESHOLD, START + timedelta(days=4), 0.8, 0.9) in kinds
+        assert len(result.hard_breaks) == 2
+        assert DriftFlag.HARD_BREAK in result.flags and result.pre_verdict == PreVerdict.SUSPICIOUS
+
+    def test_detection_threshold_break_carries_the_class(self):
+        result = analyse(
+            task="det", confidences=(0.9,) * 4, n=400,
+            stats_kwargs_for_period=lambda i: {"threshold": 0.8 if i < 2 else 0.7}
+        )
+        thresholds = [item for item in result.hard_breaks if item.kind == HardBreakKind.THRESHOLD]
+        assert {item.class_name for item in thresholds} == {"Good", "NG"}
+        assert all(item.date == START + timedelta(days=2) and item.from_value == 0.8 and item.to_value == 0.7
+                   for item in thresholds)
+
+    def test_class_list_break(self):
+        result = analyse(
+            confidences=(0.93,) * 4,
+            doc_kwargs_for_period=lambda i: {"classes": ["Good", "NG"] if i < 2 else ["Good", "NG", "Scratch"]}
+        )
+        classes = [item for item in result.hard_breaks if item.kind == HardBreakKind.CLASSES]
+        assert len(classes) == 1 and classes[0].to_value == ["Good", "NG", "Scratch"]
+        assert result.classes == ["Good", "NG", "Scratch"]
+
+    def test_several_values_inside_one_period(self):
+        # Two products in the same period with different backends
+        documents = generate_documents("cls", 2, lambda i: 0.9, n=600)
+        documents += generate_documents(
+            "cls", 2, lambda i: 0.9, n=600, seed=5, stats_kwargs_for_period=lambda i: {"backend": "trt"},
+            doc_kwargs_for_period=lambda i: {"product_id": "PR-X"}
+        )
+        for doc in documents[2:]:
+            doc["productId"] = "PR-X-" + doc["productId"]
+        periods = build_periods(aggregate(documents), DriftWindowMode.CURRENT)
+        windows = DriftWindow(START, START + timedelta(days=2))
+        result = DriftAnalyzer("MetalCls", "1.0", "cls", None, periods, windows, DriftFilters(), Granularity.DAILY).run()
+        backend_breaks = [item for item in result.hard_breaks if item.kind == HardBreakKind.BACKEND]
+        assert len(backend_breaks) == 1
+        assert backend_breaks[0].date == START and backend_breaks[0].to_value == ["trt", "ts"]
+        assert result.periods[0].backends == ["trt", "ts"]
+
+
+class TestBinsAndEquipment:
+    def test_incompatible_bins(self):
+        other = {"confidenceEdges": [0.0, 0.5, 1.0], "nearThresholdMargin": 0.05, "boxesPerImageMax": 5}
+        result = analyse(
+            confidences=(0.93,) * 6,
+            doc_kwargs_for_period=lambda i: {"bins": other} if i >= 3 else {}
+        )
+        assert result.data_quality.incompatible_bins
+        assert DriftFlag.INCOMPATIBLE_BINS in result.flags and result.pre_verdict == PreVerdict.UNDETERMINED
+        assert result.change_point is None
+        crossing = next(item for item in result.consecutive if item.date == START + timedelta(days=3))
+        assert crossing.psi_confidence is None and crossing.psi_class is not None
+        assert len(result.periods) == 6
+
+    def test_equipment_entry_and_missing_periods(self):
+        documents = generate_documents(
+            "cls", 4, lambda i: 0.9, n=600, equipments=[("EQ-01", "Line_01"), ("EQ-02", "Line_02")]
+        )
+        for doc in documents[2:]:
+            doc["equipments"] = [item for item in doc["equipments"] if item["equipmentId"] != "EQ-02"]
+        periods = build_periods(aggregate(documents, "EQ-02"), DriftWindowMode.CURRENT)
+        windows = DriftWindow(START, START + timedelta(days=4))
+        result = DriftAnalyzer(
+            "MetalCls", "1.0", "cls", None, periods, windows, DriftFilters(equipment_id="EQ-02"), Granularity.DAILY
+        ).run()
+        assert len(result.periods) == 2
+        assert result.data_quality.periods_missing_equipment == [START + timedelta(days=2), START + timedelta(days=3)]
+        assert result.sites_seen.equipment_ids == ["EQ-02"]
+        assert result.periods[0].prediction_count == 600
+
+
+class TestRounding:
+    def test_floats_are_rounded(self):
+        result = analyse()
+        for item in result.periods:
+            assert item.mean_confidence == round(item.mean_confidence, CONFIG.decimals)
+            for value in item.confidence_histogram:
+                assert value == round(value, CONFIG.decimals)
+        assert result.change_point.psi_confidence == round(result.change_point.psi_confidence, CONFIG.decimals)
+        assert math.isclose(sum(result.change_point.before.class_distribution.values()), 1.0, abs_tol=1e-3)

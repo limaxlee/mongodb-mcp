@@ -1,3 +1,8 @@
+> **Outdated.** This guide describes the previous implementation, which scanned raw inspection documents. The
+> current tool reads the pre-aggregated `inspectionStatistics` collection; see [DATA_DRIFT.md](../DATA_DRIFT.md)
+> and [inspection_statistics.md](inspection_statistics.md). The purpose, the kinds of drift and the reading rules
+> for PSI still apply; buckets, KS tests, trends, outliers, box geometry and image spec breaks no longer exist.
+
 # [Data Service] Data Drift Analysis — How It Works
 
 **Korean version:** [data_drift.ko.md](data_drift.ko.md)
