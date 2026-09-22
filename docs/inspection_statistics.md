@@ -484,3 +484,46 @@ bookkeeping numbers (about 45 for detection with the `images` block).
 
 Far below the 16 MB limit, but a detection model with many classes and many equipments is still too large to hand
 to an LLM raw. The tool should project only `total` or one equipment, and only the fields it needs, before returning.
+
+
+
+업무 성과
+
+플랫폼 데이터 서비스(cosmo-data-backend) 기능 고도화:
+검사 결과 일별 요약 집계(inspectionsSummary) 워커 구현: 모델·사이트·공정·일 단위 클래스별 건수, 신뢰도·처리시간 통계, 실시간 집계 및 온디맨드 재집계 경로
+데이터 드리프트 분석용 통계 사전 집계(inspectionStatistics) 컬렉션 설계
+Docker/K8s 배포 구성 및 서버 배포
+자연어 기반 데이터 분석 AI Agent(Data Agent) 개발 및 배포:
+멀티 에이전트 구조 설계·구현: Root Orchestrator + MongoDB/Milvus 전문 에이전트 + 대화 제목 생성 에이전트
+Fabrix ADK 및 가우스 모델 검증 결과 tool calling 제약 확인, Google ADK + 오픈 LLM(Qwen) 기반 구조로 전환
+세션·이벤트 PostgreSQL 영속화, 세션 단위 실행 잠금, 비동기 실행 모델(202 + SSE) 및 Object Storage 기반 이미지 업로드 구현
+실행 시간·토큰 사용량 로깅 플러그인, 국/영문 아키텍처 문서, 개발 로드맵 및 SSO 인증 설계서 작성
+채팅 UI 프론트엔드(Next.js) 구현 및 배포
+Agent용 MCP 서버 구축:
+MongoDB MCP: CRUD·집계·인덱스 관리 도구 및 검사 모델 조회, 검사 요약 조회, 데이터 드리프트 분석(PSI/JS/카이제곱, 하드 브레이크 감지, 사전 판정) 전용 도구 구현
+Milvus MCP: 컬렉션 관리, 이미지 임베딩 기반 유사 검색, k-center 코어셋 샘플링 및 ZIP 내보내기 도구 구현
+VFM(DINOv3) 특징 추출 서비스 구축: 전달받은 체크포인트로 FastAPI 서빙 구현, 2048차원 특징 벡터 및 레이어별 특징 맵 제공, Milvus 유사 검색 연동
+자기계발
+
+전화한국어 과정 수료 (지속 수강 중)
+Star Week AI 과정 5개 수료: MLOps 3개 과정(기초부터 ML서비스 실무, Model Development & Integration, Model Deployment & Monitoring), AI Agent 시대에 익혀야 할 역량, Integrating AI into the Product Architecture
+
+
+new 
+업무 성과
+
+플랫폼 데이터 서비스 기능 고도화:
+검사 결과 일별 요약 집계 워커 구현
+전달된 검사 데이터의 특징 자동 추출 파이프라인 설계 및 구현 중
+자연어 기반 데이터 분석 AI Agent(Data Agent) 개발 및 배포:
+Google ADK + 오픈 LLM 기반 멀티 에이전트 구조 설계·구현 (Root Orchestrator + MongoDB/Milvus 전문 에이전트)
+세션 영속화, 비동기 실행 모델, 이미지 업로드 구현
+채팅 UI 프론트엔드 구현 및 배포
+Agent용 MCP 서버 구축:
+MongoDB MCP: 검사 모델·검사 요약 조회, 데이터 드리프트 분석 도구
+Milvus MCP: 이미지 유사 검색, 코어셋 샘플링 도구
+VFM 특징 추출 서비스 구축: 체크포인트 기반 FastAPI 서빙 구현 및 Milvus 유사 검색 연동
+자기계발
+
+전화한국어 과정 수료 (지속 수강 중)
+Star Week AI 과정 5개 수료: MLOps 3개, AI Agent 역량, Integrating AI into the Product Architecture
